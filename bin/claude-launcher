@@ -1,0 +1,664 @@
+#!/usr/bin/env bash
+#
+# claude-launcher - Interactive project selector for Claude Code
+#
+# Usage:
+#   claude-launcher           # Show project menu
+#   claude-launcher --add     # Add current directory to manual paths
+#   claude-launcher --add /path/to/project
+#   claude-launcher --remove  # Remove a path interactively
+#   claude-launcher --list    # List all discovered projects
+
+set -euo pipefail
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+CONFIG_FILE="${HOME}/.claude/project-launcher.conf"
+HISTORY_FILE="${HOME}/.claude/project-launcher-history"
+MANUAL_PATHS_FILE="${HOME}/.claude/project-launcher-paths"
+HISTORY_MAX=50
+
+# Defaults
+SCAN_PATHS=""
+MAX_DEPTH=5
+
+# ============================================================================
+# Functions
+# ============================================================================
+
+die() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+show_welcome() {
+    local cyan='\033[1;36m'
+    local dim='\033[2m'
+    local reset='\033[0m'
+
+    clear
+    echo -e "${cyan}╭─────────────────────────────────────╮${reset}"
+    echo -e "${cyan}│       Claude Code Launcher          │${reset}"
+    echo -e "${cyan}╰─────────────────────────────────────╯${reset}"
+    echo ""
+    echo -e "${dim}Select a project to open with Claude Code.${reset}"
+    echo -e "${dim}Use arrow keys to navigate, type to filter.${reset}"
+}
+
+ensure_fzf() {
+    if ! command -v fzf &>/dev/null; then
+        local yellow='\033[0;33m'
+        local dim='\033[2m'
+        local reset='\033[0m'
+        echo -e "${yellow}fzf (fuzzy finder) is required for the project menu.${reset}"
+        echo -e "${dim}Installing via: sudo apt install fzf${reset}"
+        echo ""
+        sudo apt update -qq && sudo apt install -y fzf || die "Failed to install fzf"
+        echo ""
+    fi
+}
+
+check_dependencies() {
+    show_welcome
+    ensure_fzf
+    if ! command -v claude &>/dev/null; then
+        die "claude is not installed or not in PATH"
+    fi
+}
+
+load_config() {
+    local -a args=("$@")
+
+    # If paths passed as arguments, use those
+    if [[ ${#args[@]} -gt 0 ]]; then
+        SCAN_PATHS="${args[*]}"
+        return
+    fi
+
+    # Otherwise try config file
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+
+    if [[ -z "$SCAN_PATHS" ]]; then
+        die "No paths specified. Either:
+  - Pass paths as arguments: claude-launcher ~/projects/foo ~/projects/bar
+  - Or create config: echo 'SCAN_PATHS=\"\$HOME/projects\"' > ~/.claude/project-launcher.conf"
+    fi
+}
+
+get_recent_project() {
+    if [[ -f "$HISTORY_FILE" ]]; then
+        head -n1 "$HISTORY_FILE" | cut -d'|' -f2
+    fi
+}
+
+save_to_history() {
+    local project_path="$1"
+    local timestamp
+    timestamp=$(date +%s)
+
+    local temp_file
+    temp_file=$(mktemp)
+    echo "${timestamp}|${project_path}" > "$temp_file"
+
+    if [[ -f "$HISTORY_FILE" ]]; then
+        grep -v "|${project_path}$" "$HISTORY_FILE" 2>/dev/null | head -n $((HISTORY_MAX - 1)) >> "$temp_file" || true
+    fi
+
+    mv "$temp_file" "$HISTORY_FILE"
+}
+
+browse_for_directory() {
+    local start_path="${1:-$HOME}"
+
+    # Expand tilde
+    start_path="${start_path/#\~/$HOME}"
+
+    # Get absolute path but preserve symlinks
+    if [[ -d "$start_path" ]]; then
+        start_path=$(cd "$start_path" 2>/dev/null && pwd) || start_path="$HOME"
+    else
+        start_path="$HOME"
+    fi
+
+    local current_dir="$start_path"
+
+    while true; do
+        # Get directories in current location (resolve path for finding but keep original for display)
+        local real_dir
+        real_dir=$(cd "$current_dir" 2>/dev/null && pwd -P) || real_dir="$current_dir"
+
+        local dirs=()
+        dirs+=(".")
+        dirs+=("..")
+
+        while IFS= read -r dir; do
+            [[ -n "$dir" ]] && dirs+=("$dir")
+        done < <(find "$real_dir" -maxdepth 1 -type d -not -path "$real_dir" -printf "%f\n" 2>/dev/null | sort)
+
+        # Also find symlinks to directories
+        while IFS= read -r link; do
+            [[ -n "$link" ]] && dirs+=("${link}@")
+        done < <(find "$real_dir" -maxdepth 1 -type l -printf "%f\n" 2>/dev/null | while read -r l; do [[ -d "$real_dir/$l" ]] && echo "$l"; done | sort)
+
+        local header="╭─────────────────────────────────────────╮
+│         Directory Browser               │
+╰─────────────────────────────────────────╯
+Current: $current_dir
+
+. = Select this directory
+.. = Go up one level
+@ suffix = symlink"
+
+        local selection
+        selection=$(printf '%s\n' "${dirs[@]}" | fzf \
+            --height=80% \
+            --layout=reverse \
+            --border=rounded \
+            --header="$header" \
+            --header-first \
+            --prompt="> " \
+            --preview="if [[ {} == '.' ]]; then echo 'Select: $current_dir'; elif [[ {} == '..' ]]; then echo 'Go to: $(dirname "$current_dir")'; else target='$real_dir/{}'; target=\${target%@}; if [[ -L \"\$target\" ]]; then echo \"Symlink to: \$(readlink -f \"\$target\")\"; echo ''; fi; ls -la \"\$target\" 2>/dev/null | head -20; fi" \
+            --preview-window=right:60%:wrap) || return 1
+
+        if [[ "$selection" == "." ]]; then
+            echo "$current_dir"
+            return 0
+        elif [[ "$selection" == ".." ]]; then
+            current_dir=$(dirname "$current_dir")
+        else
+            # Remove @ suffix if present (symlink indicator)
+            selection="${selection%@}"
+            local new_dir="$current_dir/$selection"
+            # Keep symlink path, don't resolve
+            current_dir="$new_dir"
+        fi
+    done
+}
+
+add_manual_path() {
+    ensure_fzf
+
+    # Determine starting directory
+    local start_dir="$HOME/projects"
+    [[ ! -d "$start_dir" ]] && start_dir="$HOME"
+
+    # Launch browser
+    local path
+    path=$(browse_for_directory "$start_dir") || {
+        echo "Cancelled."
+        return 1
+    }
+
+    # Check if already in manual paths
+    if [[ -f "$MANUAL_PATHS_FILE" ]] && grep -qx "$path" "$MANUAL_PATHS_FILE" 2>/dev/null; then
+        echo "Already registered: $path"
+        return 0
+    fi
+
+    # Check if it would be discovered via SCAN_PATHS
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE" 2>/dev/null || true
+        for scan_path in $SCAN_PATHS; do
+            local expanded
+            expanded=$(eval echo "$scan_path")
+            if [[ "$path" == "$expanded"/* ]] && [[ -d "$path/.git" ]]; then
+                echo "Note: This path is already discoverable via SCAN_PATHS (has .git)"
+            fi
+        done
+    fi
+
+    echo "$path" >> "$MANUAL_PATHS_FILE"
+    echo "Added: $path"
+    return 0
+}
+
+remove_manual_path() {
+    if [[ ! -f "$MANUAL_PATHS_FILE" ]] || [[ ! -s "$MANUAL_PATHS_FILE" ]]; then
+        echo "No manual paths registered."
+        return 1
+    fi
+
+    ensure_fzf
+
+    local count
+    count=$(wc -l < "$MANUAL_PATHS_FILE")
+
+    local selection
+    selection=$(cat "$MANUAL_PATHS_FILE" | fzf \
+        --height=50% \
+        --layout=reverse \
+        --border=rounded \
+        --header="╭─────────────────────────────────────────╮
+│      Remove Manual Path ($count total)       │
+╰─────────────────────────────────────────────╯
+Select path to remove (Esc to cancel)" \
+        --header-first \
+        --prompt="Remove > " \
+        --preview="echo 'Will remove:'; echo ''; echo '  {}'; echo ''; if [[ -d '{}' ]]; then echo 'Directory exists'; else echo 'Directory does not exist'; fi") || {
+        echo "Cancelled."
+        return 1
+    }
+
+    if [[ -n "$selection" ]]; then
+        local temp_file
+        temp_file=$(mktemp)
+        grep -vx "$selection" "$MANUAL_PATHS_FILE" > "$temp_file" || true
+        mv "$temp_file" "$MANUAL_PATHS_FILE"
+
+        local green='\033[0;32m'
+        local reset='\033[0m'
+        echo ""
+        echo -e "${green}✓ Removed:${reset} $selection"
+        echo ""
+        return 0
+    fi
+
+    return 1
+}
+
+list_projects() {
+    load_config
+    echo "Discovered projects:"
+    echo ""
+    discover_projects | while read -r path; do
+        local marker=""
+        if [[ ! -d "$path/.git" ]]; then
+            marker=" (manual)"
+        fi
+        echo "  $path$marker"
+    done
+}
+
+discover_projects() {
+    local projects=()
+
+    # Scan each path for .git directories
+    for scan_path in $SCAN_PATHS; do
+        local expanded
+        expanded=$(eval echo "$scan_path")
+        if [[ ! -d "$expanded" ]]; then
+            continue
+        fi
+
+        while IFS= read -r git_dir; do
+            projects+=("$(dirname "$git_dir")")
+        done < <(find "$expanded" -maxdepth "$MAX_DEPTH" \( -name 'node_modules' -o -name '.cache' -o -name 'venv' -o -name '__pycache__' \) -prune -o -type d -name '.git' -print 2>/dev/null || true)
+    done
+
+    # Add manual paths
+    if [[ -f "$MANUAL_PATHS_FILE" ]]; then
+        while IFS= read -r path; do
+            [[ -d "$path" ]] && projects+=("$path")
+        done < "$MANUAL_PATHS_FILE"
+    fi
+
+    # Output unique projects
+    printf '%s\n' "${projects[@]}" | sort -u
+}
+
+
+resolve_to_full_path() {
+    local display_name="$1"
+    display_name="${display_name% \[recent\]}"
+
+    # Already a full path?
+    if [[ -d "$display_name" ]]; then
+        echo "$display_name"
+        return
+    fi
+
+    # Try to resolve relative to scan paths
+    for scan_path in $SCAN_PATHS; do
+        local expanded
+        expanded=$(eval echo "$scan_path")
+        local parent
+        parent=$(dirname "$expanded")
+        local test_path="${parent}/${display_name}"
+
+        if [[ -d "$test_path" ]]; then
+            echo "$test_path"
+            return
+        fi
+    done
+
+    echo "$display_name"
+}
+
+show_menu() {
+    local dim='\033[2m'
+    local green='\033[0;32m'
+    local reset='\033[0m'
+
+    echo -e "${dim}Scanning for projects...${reset}" >&2
+
+    local recent_path
+    recent_path=$(get_recent_project)
+
+    # Get the root path for display
+    local root_path
+    root_path=$(eval echo "$SCAN_PATHS" | awk '{print $1}')
+
+    # Get project paths as relative paths
+    local -a projects=()
+    while IFS= read -r project_path; do
+        projects+=("${project_path#$root_path/}")
+    done < <(discover_projects)
+
+    if [[ ${#projects[@]} -eq 0 ]]; then
+        die "No projects found. Check SCAN_PATHS in $CONFIG_FILE or use --add"
+    fi
+
+    # Get recent project for highlighting
+    local recent_path
+    recent_path=$(get_recent_project)
+    local recent_relative=""
+    if [[ -n "$recent_path" ]]; then
+        recent_relative="${recent_path#$root_path/}"
+    fi
+
+    # Build tree display
+    local -A path_map
+    local -a display_lines=()
+    local -a shown_dirs=()
+    local recent_display=""
+
+    local sorted_paths
+    sorted_paths=$(printf '%s\n' "${projects[@]}" | sort)
+
+    while IFS= read -r path; do
+        IFS='/' read -ra parts <<< "$path"
+        local depth=${#parts[@]}
+
+        # Show parent directories if not yet shown
+        local dir_path=""
+        for ((d=0; d<depth-1; d++)); do
+            if [[ -n "$dir_path" ]]; then
+                dir_path="${dir_path}/${parts[$d]}"
+            else
+                dir_path="${parts[$d]}"
+            fi
+
+            local found=0
+            for shown in "${shown_dirs[@]}"; do
+                [[ "$shown" == "$dir_path" ]] && found=1 && break
+            done
+
+            if [[ $found -eq 0 ]]; then
+                shown_dirs+=("$dir_path")
+                local indent=""
+                for ((x=0; x<d; x++)); do indent+="  "; done
+                local dir_display="${indent}${parts[$d]}/"
+                display_lines+=("$dir_display")
+                path_map["$dir_display"]="$dir_path"
+            fi
+        done
+
+        # Show the project (mark recent with ★)
+        local indent=""
+        for ((x=0; x<depth-1; x++)); do indent+="  "; done
+        local name="${parts[$((depth-1))]}"
+        local display
+        if [[ "$path" == "$recent_relative" ]]; then
+            display="${indent}★ ${name}"
+            recent_display="$display"
+        else
+            display="${indent}${name}"
+        fi
+        display_lines+=("$display")
+        path_map["$display"]="$path"
+    done <<< "$sorted_paths"
+
+    # Add management options
+    display_lines+=("")
+    display_lines+=("↻ Rescan")
+    display_lines+=("+ Add path")
+    display_lines+=("- Remove path")
+
+    echo -e "${green}Found ${#projects[@]} projects in ${root_path}${reset}" >&2
+
+    # Write path map to temp file for preview
+    local map_file
+    map_file=$(mktemp)
+    for key in "${!path_map[@]}"; do
+        printf '%s\t%s\n' "$key" "${path_map[$key]}" >> "$map_file"
+    done
+
+    # Create preview script
+    local preview_script
+    preview_script=$(mktemp)
+    cat > "$preview_script" << PREVIEW_EOF
+#!/usr/bin/env bash
+display="\$1"
+
+relative=\$(grep -F "\$display	" "$map_file" 2>/dev/null | head -1 | cut -f2)
+[[ -z "\$relative" ]] && exit 0
+full_path="${root_path}/\${relative}"
+
+# Handle parent folders (end with /)
+if [[ "\$display" == */ ]]; then
+    echo "\$full_path"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Contents:"
+    echo "────────────────────────────────────────"
+    ls -p "\$full_path" 2>/dev/null | head -n 30
+    exit 0
+fi
+
+echo "\$full_path"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+if [[ -f "\$full_path/CLAUDE.md" ]]; then
+    echo ""
+    echo "CLAUDE.md:"
+    echo "────────────────────────────────────────"
+    head -n 20 "\$full_path/CLAUDE.md"
+
+    if [[ -d "\$full_path/.git" ]]; then
+        echo ""
+        echo "Git status:"
+        echo "────────────────────────────────────────"
+        (cd "\$full_path" && git status -s 2>/dev/null | head -n 20)
+    fi
+elif [[ -d "\$full_path/.git" ]]; then
+    echo ""
+    echo "Git status:"
+    echo "────────────────────────────────────────"
+    (cd "\$full_path" && git status -s 2>/dev/null | head -n 30)
+else
+    echo ""
+    echo "Contents:"
+    echo "────────────────────────────────────────"
+    ls -p "\$full_path" 2>/dev/null | head -n 30
+fi
+PREVIEW_EOF
+    chmod +x "$preview_script"
+
+    local header
+    header="╭─────────────────────────────────────────╮
+│         Claude Code Launcher            │
+╰─────────────────────────────────────────╯
+Launch Claude Code in any of your projects.
+Type to filter, arrows to navigate.
+
+${#projects[@]} projects in ${root_path}"
+
+    local selection
+    local relative
+
+    # Find line number of recent project for cursor positioning
+    local recent_line=1
+    if [[ -n "$recent_display" ]]; then
+        for i in "${!display_lines[@]}"; do
+            if [[ "${display_lines[$i]}" == "$recent_display" ]]; then
+                recent_line=$((i + 1))
+                break
+            fi
+        done
+    fi
+
+    while true; do
+        selection=$(printf '%s\n' "${display_lines[@]}" | fzf \
+            --exact \
+            --layout=reverse \
+            --border=rounded \
+            --header="$header" \
+            --header-first \
+            --prompt="> " \
+            --preview="$preview_script {}" \
+            --preview-window=right:70%:wrap \
+            --bind "start:pos($recent_line)") || true
+
+        if [[ -z "$selection" ]]; then
+            rm -f "$preview_script" "$map_file"
+            echo "Cancelled." >&2
+            exit 0
+        fi
+
+        # Trim trailing whitespace
+        selection="${selection%"${selection##*[![:space:]]}"}"
+
+        # Check if folder (ends with /) - loop back
+        if [[ "$selection" == */ ]]; then
+            continue
+        fi
+
+        # Handle management options
+        if [[ "$selection" == "↻ Rescan" ]]; then
+            rm -f "$preview_script" "$map_file"
+            local cyan='\033[1;36m'
+            local reset='\033[0m'
+            echo "" >&2
+            echo -e "${cyan}Rescanning...${reset}" >&2
+            sleep 0.5
+            # Recursively call show_menu to rescan
+            show_menu
+            return $?
+        fi
+
+        if [[ "$selection" == "+ Add path" ]]; then
+            rm -f "$preview_script" "$map_file"
+            echo "" >&2
+            add_manual_path >&2
+            if [[ $? -eq 0 ]]; then
+                local green='\033[0;32m'
+                local reset='\033[0m'
+                echo -e "${green}Refreshing menu...${reset}" >&2
+                sleep 1
+                # Recursively call show_menu to show updated list
+                show_menu
+                return $?
+            fi
+            # If cancelled, return to menu
+            continue
+        fi
+
+        if [[ "$selection" == "- Remove path" ]]; then
+            rm -f "$preview_script" "$map_file"
+            remove_manual_path >&2
+            if [[ $? -eq 0 ]]; then
+                local green='\033[0;32m'
+                local reset='\033[0m'
+                echo -e "${green}Refreshing menu...${reset}" >&2
+                sleep 1
+                # Recursively call show_menu to show updated list
+                show_menu
+                return $?
+            fi
+            # If cancelled, return to menu
+            continue
+        fi
+
+        # Look up path from selection
+        relative="${path_map[$selection]}"
+        if [[ -z "$relative" ]]; then
+            continue
+        fi
+
+        break
+    done
+
+    rm -f "$preview_script" "$map_file"
+    echo "${root_path}/${relative}"
+}
+
+usage() {
+    cat << EOF
+Usage: claude-launcher [PATHS...] [OPTIONS]
+
+Arguments:
+  PATHS         Directories to scan for .git projects
+
+Options:
+  --add         Browse and add a directory to manual paths
+  --remove      Remove a manual path interactively
+  --list        List all discovered projects
+  --help        Show this help
+
+Examples:
+  claude-launcher ~/projects/work ~/projects/personal
+  claude-launcher --add          # Interactive directory browser
+  claude-launcher --list ~/projects
+
+Falls back to ~/.claude/project-launcher.conf if no paths given.
+EOF
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    local -a paths=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --add)
+                add_manual_path
+                exit 0
+                ;;
+            --remove)
+                remove_manual_path
+                exit 0
+                ;;
+            --list)
+                shift
+                load_config "$@"
+                list_projects
+                exit 0
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                paths+=("$1")
+                ;;
+        esac
+        shift
+    done
+
+    check_dependencies
+    load_config "${paths[@]}"
+
+    local selected_path
+    selected_path=$(show_menu)
+
+    if [[ -n "$selected_path" && -d "$selected_path" ]]; then
+        save_to_history "$selected_path"
+        local green='\033[0;32m'
+        local cyan='\033[1;36m'
+        local reset='\033[0m'
+        echo -e "${green}Opening Claude in:${reset} ${cyan}$selected_path${reset}"
+        cd "$selected_path"
+        exec claude
+    fi
+}
+
+main "$@"
