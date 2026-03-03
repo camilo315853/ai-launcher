@@ -1,9 +1,9 @@
 name: Publish to PyPI
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_run:
+    workflows: ["Tag Protection"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       test_pypi:
@@ -16,8 +16,13 @@ jobs:
   build:
     name: Build Package
     runs-on: ubuntu-latest
+    if: >
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event.workflow_run.conclusion == 'success')
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -59,7 +64,9 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v') && github.event.inputs.test_pypi != 'true'
+    if: >
+      github.event.inputs.test_pypi != 'true' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
