@@ -1,7 +1,7 @@
 """Tests for project selector."""
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from ai_launcher.core.models import Project
 from ai_launcher.ui.selector import show_project_list
@@ -46,139 +46,98 @@ def test_show_project_list_with_projects(capsys):
 
 def test_alphabetical_sorting():
     """Test that projects are expected to be sorted alphabetically."""
-    # This tests the expected behavior - projects should come in pre-sorted
     projects = [
         Project.from_path(Path("/a/project"), is_manual=False),
         Project.from_path(Path("/b/project"), is_manual=False),
         Project.from_path(Path("/c/project"), is_manual=False),
     ]
 
-    # Verify they're in alphabetical order
     paths = [str(p.path) for p in projects]
     assert paths == sorted(paths)
 
 
-@patch("ai_launcher.ui.selector.iterfzf")
-def test_select_project_with_selection(mock_iterfzf, mock_storage, tmp_path):
+@patch("subprocess.Popen")
+@patch("ai_launcher.ui.selector.build_tree_view")
+@patch("ai_launcher.ui.selector.clear_screen")
+def test_select_project_with_selection(mock_clear, mock_tree, mock_popen, tmp_path):
     """Test successful project selection."""
-    from ai_launcher.ui.preview import format_project_line
     from ai_launcher.ui.selector import select_project
 
-    # Create test projects
     project_path = tmp_path / "test-project"
     project_path.mkdir()
+    project = Project.from_path(project_path, is_manual=False)
 
-    projects = [Project.from_path(project_path, is_manual=False)]
+    # Mock build_tree_view to return known choices
+    choice_str = f"{project_path}\t\ttest-project"
+    mock_tree.return_value = ([choice_str], {choice_str: project})
 
-    # Mock iterfzf to return the formatted choice string (not raw path)
-    formatted_choice = format_project_line(
-        project_path,
-        projects[0].parent_path,
-        projects[0].is_git_repo,
-        projects[0].is_manual,
-    )
-    mock_iterfzf.return_value = formatted_choice
+    # Mock fzf to return the selected choice
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.communicate.return_value = (f"{choice_str}\n", "")
+    mock_popen.return_value = mock_process
 
-    # No need to mock storage methods - they work as-is
-    # get_default_selection_index will return 0 by default (no last opened)
-
-    result = select_project(projects, mock_storage)
+    result = select_project([project])
 
     assert result is not None
     assert result.path == project_path
 
-    # Verify iterfzf was called
-    mock_iterfzf.assert_called_once()
 
-
-@patch("ai_launcher.ui.selector.iterfzf")
-def test_select_project_cancelled(mock_iterfzf, mock_storage, tmp_path):
+@patch("subprocess.Popen")
+@patch("ai_launcher.ui.selector.build_tree_view")
+@patch("ai_launcher.ui.selector.clear_screen")
+def test_select_project_cancelled(mock_clear, mock_tree, mock_popen, tmp_path):
     """Test project selection when user cancels."""
     from ai_launcher.ui.selector import select_project
 
     project_path = tmp_path / "test-project"
     project_path.mkdir()
+    project = Project.from_path(project_path, is_manual=False)
 
-    projects = [Project.from_path(project_path, is_manual=False)]
+    choice_str = f"{project_path}\t\ttest-project"
+    mock_tree.return_value = ([choice_str], {choice_str: project})
 
-    # Mock iterfzf to return None (cancelled)
-    mock_iterfzf.return_value = None
+    # Mock fzf cancellation (exit code 1)
+    mock_process = MagicMock()
+    mock_process.returncode = 1
+    mock_process.communicate.return_value = ("", "")
+    mock_popen.return_value = mock_process
 
-    result = select_project(projects, mock_storage)
+    result = select_project([project])
 
     assert result is None
 
 
-def test_select_project_empty_list(mock_storage, capsys):
+def test_select_project_empty_list(capsys):
     """Test selecting from empty project list."""
     from ai_launcher.ui.selector import select_project
 
-    result = select_project([], mock_storage)
+    result = select_project([])
 
     assert result is None
     captured = capsys.readouterr()
     assert "No projects found" in captured.out
 
 
-@patch("ai_launcher.ui.selector.iterfzf")
-def test_select_project_with_default_index(mock_iterfzf, mock_storage, tmp_path):
-    """Test that default index is passed to fzf."""
-    from ai_launcher.ui.selector import select_project
-
-    # Create multiple projects
-    projects = []
-    for i in range(3):
-        path = tmp_path / f"project{i}"
-        path.mkdir()
-        projects.append(Project.from_path(path, is_manual=False))
-
-    # Set last opened to make project[1] the default
-    mock_storage.set_last_opened(projects[1].path)
-    mock_iterfzf.return_value = str(projects[1].path)
-
-    select_project(projects, mock_storage, show_git_status=False)
-
-    # Check that iterfzf was called with +2 (1-indexed, so index 1 = +2)
-    call_args = mock_iterfzf.call_args
-    extra_args = call_args.kwargs.get("__extra__", [])
-    assert "+2" in extra_args
-
-
-@patch("ai_launcher.ui.selector.generate_preview")
-@patch("ai_launcher.ui.selector.iterfzf")
-def test_preview_function_receives_choice_string(
-    mock_iterfzf, mock_preview, mock_storage, tmp_path
-):
-    """Test that preview function receives choice string, not index."""
-    from ai_launcher.core.models import PreviewContent
+@patch("subprocess.Popen")
+@patch("ai_launcher.ui.selector.build_tree_view")
+@patch("ai_launcher.ui.selector.clear_screen")
+def test_select_project_fzf_not_found(mock_clear, mock_tree, mock_popen, tmp_path, capsys):
+    """Test handling when fzf is not installed."""
     from ai_launcher.ui.selector import select_project
 
     project_path = tmp_path / "test-project"
     project_path.mkdir()
-    projects = [Project.from_path(project_path, is_manual=False)]
+    project = Project.from_path(project_path, is_manual=False)
 
-    # Mock preview generation
-    mock_preview.return_value = PreviewContent(
-        claude_md="Test content",
-        git_status="Clean",
-    )
+    choice_str = f"{project_path}\t\ttest-project"
+    mock_tree.return_value = ([choice_str], {choice_str: project})
 
-    # We need to actually call the preview function to test it
-    mock_iterfzf.return_value = str(project_path)
+    # Mock fzf not found
+    mock_popen.side_effect = FileNotFoundError("fzf not found")
 
-    select_project(projects, mock_storage, show_git_status=True)
+    result = select_project([project])
 
-    # Get the preview function that was passed to iterfzf
-    call_args = mock_iterfzf.call_args
-    preview_fn = call_args.kwargs.get("preview")
-
-    # Preview function should exist
-    assert preview_fn is not None
-
-    # Call preview function with a choice string
-    choice_str = str(project_path)
-    result = preview_fn(choice_str)
-
-    # Should return formatted preview
-    assert isinstance(result, str)
-    assert len(result) > 0
+    assert result is None
+    captured = capsys.readouterr()
+    assert "fzf" in captured.out.lower()

@@ -47,13 +47,21 @@ def test_scan_respects_max_depth(tmp_path):
     assert len(projects) == 1
 
 
-def test_get_all_projects_removes_duplicates(tmp_project_dir, mock_storage):
+def test_get_all_projects_removes_duplicates(tmp_project_dir):
     """Test that manual and discovered projects are deduplicated."""
-    # Add manual project that overlaps with discovered
-    manual_path = tmp_project_dir / "project1"
-    mock_storage.add_manual_path(manual_path)
+    from ai_launcher.core.models import Project
 
-    manual_projects = mock_storage.get_manual_projects()
+    # Create a manual project that overlaps with a discovered one
+    manual_path = (tmp_project_dir / "project1").resolve()
+    manual_projects = [
+        Project(
+            path=manual_path,
+            name=manual_path.name,
+            parent_path=manual_path.parent,
+            is_git_repo=True,
+            is_manual=True,
+        )
+    ]
 
     all_projects = get_all_projects(
         [tmp_project_dir],

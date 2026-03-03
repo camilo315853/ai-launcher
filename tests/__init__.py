@@ -1,1 +1,1 @@
-"""Tests for claude-launcher."""
+"""Tests for ai-launcher."""

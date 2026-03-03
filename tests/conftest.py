@@ -1,6 +1,7 @@
 """Pytest configuration and fixtures."""
 
 import pytest
+from pathlib import Path
 
 
 @pytest.fixture
@@ -20,12 +21,3 @@ def tmp_project_dir(tmp_path):
     (tmp_path / ".cache" / "stuff").mkdir(parents=True)
 
     return tmp_path
-
-
-@pytest.fixture
-def mock_storage(tmp_path):
-    """Create a mock storage instance."""
-    from ai_launcher.core.storage import Storage
-
-    db_path = tmp_path / "test.db"
-    return Storage(db_path)

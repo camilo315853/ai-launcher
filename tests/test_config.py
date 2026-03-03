@@ -1,6 +1,9 @@
 """Tests for configuration management."""
 
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from ai_launcher.core.config import ConfigManager
 from ai_launcher.core.models import ConfigData
@@ -93,7 +96,7 @@ def test_get_data_dir():
 
     assert data_dir.exists()
     assert data_dir.is_dir()
-    assert "claude-launcher" in str(data_dir)
+    assert "ai-launcher" in str(data_dir)
 
 
 def test_get_database_path():
@@ -103,7 +106,7 @@ def test_get_database_path():
     db_path = get_database_path()
 
     assert db_path.name == "projects.db"
-    assert "claude-launcher" in str(db_path.parent)
+    assert "ai-launcher" in str(db_path.parent)
 
 
 def test_config_multiple_paths(tmp_path):
@@ -141,3 +144,84 @@ def test_config_custom_prune_dirs(tmp_path):
 
     assert len(loaded.scan.prune_dirs) == 4
     assert "venv" in loaded.scan.prune_dirs
+
+
+class TestFirstTimeSetup:
+    """Tests for run_first_time_setup()."""
+
+    def test_setup_with_valid_path(self, tmp_path, capsys):
+        config_path = tmp_path / "config.toml"
+        manager = ConfigManager(config_path)
+
+        scan_dir = tmp_path / "projects"
+        scan_dir.mkdir()
+
+        inputs = iter([str(scan_dir), ""])
+        with patch("builtins.input", side_effect=inputs):
+            config = manager.run_first_time_setup()
+
+        assert len(config.scan.paths) == 1
+        assert config.scan.paths[0] == scan_dir
+        assert config_path.exists()
+
+        captured = capsys.readouterr()
+        assert "Added:" in captured.out
+
+    def test_setup_empty_input(self, tmp_path, capsys):
+        config_path = tmp_path / "config.toml"
+        manager = ConfigManager(config_path)
+
+        with patch("builtins.input", return_value=""):
+            config = manager.run_first_time_setup()
+
+        assert config.scan.paths == []
+        captured = capsys.readouterr()
+        assert "No paths added" in captured.out
+
+    def test_setup_nonexistent_path_declined(self, tmp_path, capsys):
+        config_path = tmp_path / "config.toml"
+        manager = ConfigManager(config_path)
+
+        inputs = iter([str(tmp_path / "missing"), "n", ""])
+        with patch("builtins.input", side_effect=inputs):
+            config = manager.run_first_time_setup()
+
+        assert config.scan.paths == []
+        captured = capsys.readouterr()
+        assert "Warning:" in captured.out
+
+    def test_setup_nonexistent_path_accepted(self, tmp_path, capsys):
+        config_path = tmp_path / "config.toml"
+        manager = ConfigManager(config_path)
+
+        missing = tmp_path / "future_projects"
+        inputs = iter([str(missing), "y", ""])
+        with patch("builtins.input", side_effect=inputs):
+            config = manager.run_first_time_setup()
+
+        assert len(config.scan.paths) == 1
+        assert config.scan.paths[0] == missing
+
+    def test_setup_keyboard_interrupt(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        manager = ConfigManager(config_path)
+
+        with patch("builtins.input", side_effect=KeyboardInterrupt):
+            with pytest.raises(SystemExit) as exc_info:
+                manager.run_first_time_setup()
+            assert exc_info.value.code == 0
+
+    def test_setup_multiple_paths(self, tmp_path, capsys):
+        config_path = tmp_path / "config.toml"
+        manager = ConfigManager(config_path)
+
+        dir1 = tmp_path / "projects"
+        dir2 = tmp_path / "work"
+        dir1.mkdir()
+        dir2.mkdir()
+
+        inputs = iter([str(dir1), str(dir2), ""])
+        with patch("builtins.input", side_effect=inputs):
+            config = manager.run_first_time_setup()
+
+        assert len(config.scan.paths) == 2

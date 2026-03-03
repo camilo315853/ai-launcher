@@ -1,12 +1,14 @@
-"""Integration tests for claude-launcher."""
+"""Integration tests for ai-launcher."""
+
+from pathlib import Path
 
 from ai_launcher.core.config import ConfigManager
 from ai_launcher.core.discovery import get_all_projects
-from ai_launcher.core.storage import Storage
+from ai_launcher.core.models import Project
 
 
 def test_full_workflow(tmp_path):
-    """Test complete workflow from config to project selection."""
+    """Test complete workflow from config to project discovery."""
     # Setup: Create config
     config_path = tmp_path / "config" / "config.toml"
     config_path.parent.mkdir(parents=True)
@@ -28,17 +30,12 @@ def test_full_workflow(tmp_path):
     loaded_config = manager.load()
     assert len(loaded_config.scan.paths) == 1
 
-    # Initialize storage
-    db_path = tmp_path / "data" / "projects.db"
-    storage = Storage(db_path)
-
-    # Get projects
-    manual_projects = storage.get_manual_projects()
+    # Get projects (no manual projects)
     all_projects = get_all_projects(
         loaded_config.scan.paths,
         loaded_config.scan.max_depth,
         loaded_config.scan.prune_dirs,
-        manual_projects,
+        [],
     )
 
     # Should find both projects
@@ -47,13 +44,6 @@ def test_full_workflow(tmp_path):
     # Projects should be alphabetically sorted
     assert all_projects[0].name == "project-a"
     assert all_projects[1].name == "project-b"
-
-    # Record last opened
-    storage.set_last_opened(all_projects[1].path)
-
-    # Get default selection
-    default_index = storage.get_default_selection_index(all_projects)
-    assert default_index == 1  # project-b
 
 
 def test_manual_and_discovered_integration(tmp_path):
@@ -65,17 +55,21 @@ def test_manual_and_discovered_integration(tmp_path):
     (discovered_dir / "discovered-repo" / ".git").mkdir(parents=True)
     manual_dir.mkdir(parents=True)
 
-    # Setup storage
-    storage = Storage(tmp_path / "test.db")
-    storage.add_manual_path(manual_dir)
+    # Create manual project (as the CLI does from --manual-paths)
+    manual_project = Project(
+        path=manual_dir,
+        name=manual_dir.name,
+        parent_path=manual_dir.parent,
+        is_git_repo=False,
+        is_manual=True,
+    )
 
     # Get all projects
-    manual_projects = storage.get_manual_projects()
     all_projects = get_all_projects(
         [discovered_dir],
         5,
         ["node_modules"],
-        manual_projects,
+        [manual_project],
     )
 
     # Should have both projects
@@ -89,24 +83,20 @@ def test_manual_and_discovered_integration(tmp_path):
     assert discovered_count == 1
 
 
-def test_error_recovery_integration(tmp_path):
-    """Test that system recovers from errors gracefully."""
-    db_path = tmp_path / "test.db"
+def test_error_recovery_config(tmp_path):
+    """Test that config system recovers from corrupted files."""
+    config_path = tmp_path / "config.toml"
 
-    # Create corrupted database
-    with open(db_path, "w") as f:
-        f.write("corrupted")
+    # Create corrupted config
+    config_path.write_text("this is not valid toml [[[")
 
-    # Storage should recover
-    storage = Storage(db_path)
+    # ConfigManager should recover gracefully with defaults
+    manager = ConfigManager(config_path)
+    config = manager.load()
 
-    # Should be able to use storage normally
-    storage.add_manual_path(tmp_path / "test")
-    assert len(storage.get_manual_paths()) == 1
-
-    # Backup should exist
-    backups = list(tmp_path.glob("test.db.backup.*"))
-    assert len(backups) == 1
+    # Should get valid defaults
+    assert config.scan.max_depth == 5
+    assert config.scan.paths == []
 
 
 def test_empty_config_workflow(tmp_path):
@@ -121,7 +111,6 @@ def test_empty_config_workflow(tmp_path):
     assert config.scan.max_depth == 5
 
     # With empty scan paths, should get empty project list
-    Storage(tmp_path / "test.db")
     all_projects = get_all_projects(
         config.scan.paths,
         config.scan.max_depth,
