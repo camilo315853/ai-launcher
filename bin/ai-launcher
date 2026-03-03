@@ -1,0 +1,1057 @@
+#!/usr/bin/env bash
+#
+# ai-launcher - Interactive project selector for AI coding assistants
+#
+# Usage:
+#   ai-launcher           # Show project menu
+#   ai-launcher --add     # Add current directory to manual paths
+#   ai-launcher --add /path/to/project
+#   ai-launcher --remove  # Remove a path interactively
+#   ai-launcher --list    # List all discovered projects
+
+set -euo pipefail
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+CONFIG_FILE="${HOME}/.config/ai-launcher/config.toml"
+HISTORY_FILE="${HOME}/.config/ai-launcher/history"
+MANUAL_PATHS_FILE="${HOME}/.config/ai-launcher/manual-paths"
+HISTORY_MAX=50
+
+# Defaults
+SCAN_PATHS=""
+MAX_DEPTH=5
+
+# ============================================================================
+# Functions
+# ============================================================================
+
+die() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+show_welcome() {
+    local cyan='\033[1;36m'
+    local dim='\033[2m'
+    local reset='\033[0m'
+
+    clear
+    echo -e "${cyan}╭─────────────────────────────────────╮${reset}"
+    echo -e "${cyan}│            AI Launcher              │${reset}"
+    echo -e "${cyan}│        by Solent Labs™              │${reset}"
+    echo -e "${cyan}╰─────────────────────────────────────╯${reset}"
+    echo ""
+    echo -e "${dim}Select a project to open with your AI coding assistant.${reset}"
+    echo -e "${dim}Use arrow keys to navigate, type to filter.${reset}"
+}
+
+ensure_fzf() {
+    if ! command -v fzf &>/dev/null; then
+        local yellow='\033[0;33m'
+        local dim='\033[2m'
+        local reset='\033[0m'
+        echo -e "${yellow}fzf (fuzzy finder) is required for the project menu.${reset}"
+        echo -e "${dim}Installing via: sudo apt install fzf${reset}"
+        echo ""
+        sudo apt update -qq && sudo apt install -y fzf || die "Failed to install fzf"
+        echo ""
+    fi
+}
+
+detect_platform() {
+    local os
+    os=$(uname -s)
+    case "$os" in
+        Linux*)
+            if grep -qi microsoft /proc/version 2>/dev/null; then
+                echo "wsl"
+            else
+                echo "linux"
+            fi
+            ;;
+        Darwin*)
+            echo "macos"
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            echo "windows"
+            ;;
+        *)
+            echo "unknown"
+            ;;
+    esac
+}
+
+install_claude_cli() {
+    local platform
+    platform=$(detect_platform)
+
+    local cyan='\033[1;36m'
+    local yellow='\033[0;33m'
+    local dim='\033[2m'
+    local bold='\033[1m'
+    local reset='\033[0m'
+
+    echo ""
+    echo -e "${yellow}Claude Code CLI is not installed.${reset}"
+    echo ""
+    echo -e "${bold}Official Documentation:${reset}"
+    echo -e "${dim}https://code.claude.com/docs/en/setup${reset}"
+    echo ""
+
+    case "$platform" in
+        linux|wsl)
+            echo -e "${bold}Installation command for Linux/WSL:${reset}"
+            echo -e "${cyan}curl -fsSL https://claude.ai/install.sh | bash${reset}"
+            echo ""
+            read -p "Would you like to install Claude Code CLI now? (y/N): " -n 1 -r
+            echo ""
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                echo ""
+                echo -e "${dim}Running installation...${reset}"
+                if curl -fsSL https://claude.ai/install.sh | bash; then
+                    echo ""
+                    echo -e "${cyan}✓ Claude Code CLI installed successfully!${reset}"
+                    echo -e "${dim}You may need to restart your shell or run: source ~/.bashrc${reset}"
+                    echo ""
+                    read -p "Press Enter to continue..."
+                    # Try to reload PATH
+                    export PATH="$HOME/.local/bin:$PATH"
+                    if command -v claude &>/dev/null; then
+                        return 0
+                    else
+                        echo -e "${yellow}Please restart your shell and run ai-launcher again.${reset}"
+                        exit 0
+                    fi
+                else
+                    die "Installation failed"
+                fi
+            else
+                echo ""
+                echo -e "${dim}Installation cancelled. Install manually:${reset}"
+                echo -e "${cyan}curl -fsSL https://claude.ai/install.sh | bash${reset}"
+                exit 1
+            fi
+            ;;
+        macos)
+            echo -e "${bold}Installation command for macOS:${reset}"
+            echo -e "${cyan}curl -fsSL https://claude.ai/install.sh | bash${reset}"
+            echo ""
+            read -p "Would you like to install Claude Code CLI now? (y/N): " -n 1 -r
+            echo ""
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                echo ""
+                echo -e "${dim}Running installation...${reset}"
+                if curl -fsSL https://claude.ai/install.sh | bash; then
+                    echo ""
+                    echo -e "${cyan}✓ Claude Code CLI installed successfully!${reset}"
+                    echo -e "${dim}You may need to restart your shell or run: source ~/.bashrc${reset}"
+                    echo ""
+                    read -p "Press Enter to continue..."
+                    export PATH="$HOME/.local/bin:$PATH"
+                    if command -v claude &>/dev/null; then
+                        return 0
+                    else
+                        echo -e "${yellow}Please restart your shell and run ai-launcher again.${reset}"
+                        exit 0
+                    fi
+                else
+                    die "Installation failed"
+                fi
+            else
+                echo ""
+                echo -e "${dim}Installation cancelled. Install manually:${reset}"
+                echo -e "${cyan}curl -fsSL https://claude.ai/install.sh | bash${reset}"
+                exit 1
+            fi
+            ;;
+        windows)
+            echo -e "${bold}Installation command for Windows PowerShell:${reset}"
+            echo -e "${cyan}irm https://claude.ai/install.ps1 | iex${reset}"
+            echo ""
+            echo -e "${yellow}Please run the above command in PowerShell to install.${reset}"
+            exit 1
+            ;;
+        *)
+            echo -e "${yellow}Unknown platform. Please visit:${reset}"
+            echo -e "${cyan}https://code.claude.com/docs/en/setup${reset}"
+            exit 1
+            ;;
+    esac
+}
+
+check_dependencies() {
+    show_welcome
+    ensure_fzf
+    if ! command -v claude &>/dev/null; then
+        install_claude_cli
+    fi
+}
+
+load_config() {
+    local -a args=("$@")
+
+    # If paths passed as arguments, use those
+    if [[ ${#args[@]} -gt 0 ]]; then
+        SCAN_PATHS="${args[*]}"
+        return
+    fi
+
+    # Otherwise try config file
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+
+    if [[ -z "$SCAN_PATHS" ]]; then
+        die "No paths specified. Either:
+  - Pass paths as arguments: ai-launcher ~/projects/foo ~/projects/bar
+  - Or create config: echo 'scan.paths=\"\$HOME/projects\"' > ~/.config/ai-launcher/config.toml"
+    fi
+}
+
+get_recent_project() {
+    if [[ -f "$HISTORY_FILE" ]]; then
+        head -n1 "$HISTORY_FILE" | cut -d'|' -f2
+    fi
+}
+
+save_to_history() {
+    local project_path="$1"
+    local timestamp
+    timestamp=$(date +%s)
+
+    # Ensure config directory exists
+    mkdir -p "$(dirname "$HISTORY_FILE")"
+
+    local temp_file
+    temp_file=$(mktemp)
+    echo "${timestamp}|${project_path}" > "$temp_file"
+
+    if [[ -f "$HISTORY_FILE" ]]; then
+        grep -v "|${project_path}$" "$HISTORY_FILE" 2>/dev/null | head -n $((HISTORY_MAX - 1)) >> "$temp_file" || true
+    fi
+
+    mv "$temp_file" "$HISTORY_FILE"
+}
+
+browse_for_directory() {
+    local start_path="${1:-$HOME}"
+
+    # Expand tilde
+    start_path="${start_path/#\~/$HOME}"
+
+    # Get absolute path but preserve symlinks
+    if [[ -d "$start_path" ]]; then
+        start_path=$(cd "$start_path" 2>/dev/null && pwd) || start_path="$HOME"
+    else
+        start_path="$HOME"
+    fi
+
+    local current_dir="$start_path"
+
+    while true; do
+        # Get directories in current location (resolve path for finding but keep original for display)
+        local real_dir
+        real_dir=$(cd "$current_dir" 2>/dev/null && pwd -P) || real_dir="$current_dir"
+
+        local dirs=()
+        dirs+=(".")
+        dirs+=("..")
+
+        while IFS= read -r dir; do
+            [[ -n "$dir" ]] && dirs+=("$dir")
+        done < <(find "$real_dir" -maxdepth 1 -type d -not -path "$real_dir" -printf "%f\n" 2>/dev/null | sort)
+
+        # Also find symlinks to directories
+        while IFS= read -r link; do
+            [[ -n "$link" ]] && dirs+=("${link}@")
+        done < <(find "$real_dir" -maxdepth 1 -type l -printf "%f\n" 2>/dev/null | while read -r l; do [[ -d "$real_dir/$l" ]] && echo "$l"; done | sort)
+
+        local header="╭─────────────────────────────────────────╮
+│         Directory Browser               │
+╰─────────────────────────────────────────╯
+Current: $current_dir
+
+. = Select this directory
+.. = Go up one level
+@ suffix = symlink"
+
+        local selection
+        selection=$(printf '%s\n' "${dirs[@]}" | fzf \
+            --height=80% \
+            --layout=reverse \
+            --border=rounded \
+            --header="$header" \
+            --header-first \
+            --prompt="> " \
+            --preview="if [[ {} == '.' ]]; then echo 'Select: $current_dir'; elif [[ {} == '..' ]]; then echo 'Go to: $(dirname "$current_dir")'; else target='$real_dir/{}'; target=\${target%@}; if [[ -L \"\$target\" ]]; then echo \"Symlink to: \$(readlink -f \"\$target\")\"; echo ''; fi; ls -la \"\$target\" 2>/dev/null | head -20; fi" \
+            --preview-window=right:60%:wrap) || return 1
+
+        if [[ "$selection" == "." ]]; then
+            echo "$current_dir"
+            return 0
+        elif [[ "$selection" == ".." ]]; then
+            current_dir=$(dirname "$current_dir")
+        else
+            # Remove @ suffix if present (symlink indicator)
+            selection="${selection%@}"
+            local new_dir="$current_dir/$selection"
+            # Keep symlink path, don't resolve
+            current_dir="$new_dir"
+        fi
+    done
+}
+
+add_manual_path() {
+    ensure_fzf
+
+    # Determine starting directory
+    local start_dir="$HOME/projects"
+    [[ ! -d "$start_dir" ]] && start_dir="$HOME"
+
+    # Launch browser
+    local path
+    path=$(browse_for_directory "$start_dir") || {
+        echo "Cancelled."
+        return 1
+    }
+
+    # Check if already in manual paths
+    if [[ -f "$MANUAL_PATHS_FILE" ]] && grep -qx "$path" "$MANUAL_PATHS_FILE" 2>/dev/null; then
+        echo "Already registered: $path"
+        return 0
+    fi
+
+    # Check if it would be discovered via SCAN_PATHS
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE" 2>/dev/null || true
+        for scan_path in $SCAN_PATHS; do
+            local expanded
+            expanded=$(eval echo "$scan_path")
+            if [[ "$path" == "$expanded"/* ]] && [[ -d "$path/.git" ]]; then
+                echo "Note: This path is already discoverable via SCAN_PATHS (has .git)"
+            fi
+        done
+    fi
+
+    # Ensure config directory exists
+    mkdir -p "$(dirname "$MANUAL_PATHS_FILE")"
+
+    echo "$path" >> "$MANUAL_PATHS_FILE"
+    echo "Added: $path"
+    return 0
+}
+
+remove_manual_path() {
+    if [[ ! -f "$MANUAL_PATHS_FILE" ]] || [[ ! -s "$MANUAL_PATHS_FILE" ]]; then
+        echo "No manual paths registered."
+        return 1
+    fi
+
+    ensure_fzf
+
+    local count
+    count=$(wc -l < "$MANUAL_PATHS_FILE")
+
+    local selection
+    selection=$(cat "$MANUAL_PATHS_FILE" | fzf \
+        --height=50% \
+        --layout=reverse \
+        --border=rounded \
+        --header="╭─────────────────────────────────────────╮
+│      Remove Manual Path ($count total)       │
+╰─────────────────────────────────────────────╯
+Select path to remove (Esc to cancel)" \
+        --header-first \
+        --prompt="Remove > " \
+        --preview="echo 'Will remove:'; echo ''; echo '  {}'; echo ''; if [[ -d '{}' ]]; then echo 'Directory exists'; else echo 'Directory does not exist'; fi") || {
+        echo "Cancelled."
+        return 1
+    }
+
+    if [[ -n "$selection" ]]; then
+        local temp_file
+        temp_file=$(mktemp)
+        grep -vx "$selection" "$MANUAL_PATHS_FILE" > "$temp_file" || true
+        mv "$temp_file" "$MANUAL_PATHS_FILE"
+
+        local green='\033[0;32m'
+        local reset='\033[0m'
+        echo ""
+        echo -e "${green}✓ Removed:${reset} $selection"
+        echo ""
+        return 0
+    fi
+
+    return 1
+}
+
+list_projects() {
+    load_config
+    echo "Discovered projects:"
+    echo ""
+    discover_projects | while read -r path; do
+        local marker=""
+        if [[ ! -d "$path/.git" ]]; then
+            marker=" (manual)"
+        fi
+        echo "  $path$marker"
+    done
+}
+
+discover_projects() {
+    local projects=()
+
+    # Scan each path for .git directories
+    for scan_path in $SCAN_PATHS; do
+        local expanded
+        expanded=$(eval echo "$scan_path")
+        if [[ ! -d "$expanded" ]]; then
+            continue
+        fi
+
+        while IFS= read -r git_dir; do
+            projects+=("$(dirname "$git_dir")")
+        done < <(find "$expanded" -maxdepth "$MAX_DEPTH" \( -name 'node_modules' -o -name '.cache' -o -name 'venv' -o -name '__pycache__' \) -prune -o -type d -name '.git' -print 2>/dev/null || true)
+    done
+
+    # Add manual paths
+    if [[ -f "$MANUAL_PATHS_FILE" ]]; then
+        while IFS= read -r path; do
+            [[ -d "$path" ]] && projects+=("$path")
+        done < "$MANUAL_PATHS_FILE"
+    fi
+
+    # Output unique projects
+    printf '%s\n' "${projects[@]}" | sort -u
+}
+
+
+resolve_to_full_path() {
+    local display_name="$1"
+    display_name="${display_name% \[recent\]}"
+
+    # Already a full path?
+    if [[ -d "$display_name" ]]; then
+        echo "$display_name"
+        return
+    fi
+
+    # Try to resolve relative to scan paths
+    for scan_path in $SCAN_PATHS; do
+        local expanded
+        expanded=$(eval echo "$scan_path")
+        local parent
+        parent=$(dirname "$expanded")
+        local test_path="${parent}/${display_name}"
+
+        if [[ -d "$test_path" ]]; then
+            echo "$test_path"
+            return
+        fi
+    done
+
+    echo "$display_name"
+}
+
+show_menu() {
+    local dim='\033[2m'
+    local green='\033[0;32m'
+    local reset='\033[0m'
+
+    echo -e "${dim}Scanning for projects...${reset}" >&2
+
+    local recent_path
+    recent_path=$(get_recent_project)
+
+    # Get the root path for display
+    local root_path
+    root_path=$(eval echo "$SCAN_PATHS" | awk '{print $1}')
+
+    # Get project paths as relative paths
+    local -a projects=()
+    while IFS= read -r project_path; do
+        projects+=("${project_path#$root_path/}")
+    done < <(discover_projects)
+
+    if [[ ${#projects[@]} -eq 0 ]]; then
+        die "No projects found. Check SCAN_PATHS in $CONFIG_FILE or use --add"
+    fi
+
+    # Get recent project for highlighting
+    local recent_path
+    recent_path=$(get_recent_project)
+    local recent_relative=""
+    if [[ -n "$recent_path" ]]; then
+        recent_relative="${recent_path#$root_path/}"
+    fi
+
+    # Build tree display
+    local -A path_map
+    local -a display_lines=()
+    local -a shown_dirs=()
+    local recent_display=""
+
+    local sorted_paths
+    sorted_paths=$(printf '%s\n' "${projects[@]}" | sort)
+
+    while IFS= read -r path; do
+        IFS='/' read -ra parts <<< "$path"
+        local depth=${#parts[@]}
+
+        # Show parent directories if not yet shown
+        local dir_path=""
+        for ((d=0; d<depth-1; d++)); do
+            if [[ -n "$dir_path" ]]; then
+                dir_path="${dir_path}/${parts[$d]}"
+            else
+                dir_path="${parts[$d]}"
+            fi
+
+            local found=0
+            for shown in "${shown_dirs[@]}"; do
+                [[ "$shown" == "$dir_path" ]] && found=1 && break
+            done
+
+            if [[ $found -eq 0 ]]; then
+                shown_dirs+=("$dir_path")
+                local indent=""
+                for ((x=0; x<d; x++)); do indent+="  "; done
+                local dir_display="${indent}${parts[$d]}/"
+                display_lines+=("$dir_display")
+                path_map["$dir_display"]="$dir_path"
+            fi
+        done
+
+        # Show the project (mark recent with ★)
+        local indent=""
+        for ((x=0; x<depth-1; x++)); do indent+="  "; done
+        local name="${parts[$((depth-1))]}"
+        local display
+        if [[ "$path" == "$recent_relative" ]]; then
+            display="${indent}★ ${name}"
+            recent_display="$display"
+        else
+            display="${indent}${name}"
+        fi
+        display_lines+=("$display")
+        path_map["$display"]="$path"
+    done <<< "$sorted_paths"
+
+    # Add management options
+    display_lines+=("")
+    display_lines+=("↻ Rescan")
+    display_lines+=("+ Add path")
+    display_lines+=("- Remove path")
+
+    # Display path with ~ shorthand
+    local display_path_msg="${root_path/#$HOME/\~}"
+    echo -e "${green}Found ${#projects[@]} projects in ${display_path_msg}${reset}" >&2
+
+    # Write path map to temp file for preview
+    local map_file
+    map_file=$(mktemp)
+    for key in "${!path_map[@]}"; do
+        printf '%s\t%s\n' "$key" "${path_map[$key]}" >> "$map_file"
+    done
+
+    # Create preview script
+    local preview_script
+    preview_script=$(mktemp)
+    cat > "$preview_script" << 'PREVIEW_EOF'
+#!/usr/bin/env bash
+display="$1"
+
+relative=$(grep -F "$display	" "$MAP_FILE" 2>/dev/null | head -1 | cut -f2)
+[[ -z "$relative" ]] && exit 0
+full_path="$ROOT_PATH/${relative}"
+
+# Function to list contents with folders first
+list_contents() {
+    local path="$1"
+    local limit="$2"
+    # List directories first (with /), then files
+    (ls -1p "$path" 2>/dev/null | grep '/$'; ls -1p "$path" 2>/dev/null | grep -v '/$') | head -n "$limit"
+}
+
+# Function to get file size in human readable format
+human_size() {
+    local size=$1
+    if (( size < 1024 )); then
+        echo "${size}B"
+    elif (( size < 1048576 )); then
+        echo "$((size / 1024))KB"
+    else
+        echo "$((size / 1048576))MB"
+    fi
+}
+
+# Function to encode project path for Claude session directory
+encode_project_path() {
+    local path="$1"
+    echo "$path" | sed 's|/|-|g'
+}
+
+# Handle parent folders (end with /)
+if [[ "$display" == */ ]]; then
+    echo "$full_path"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Contents:"
+    echo "────────────────────────────────────────"
+    list_contents "$full_path" 30
+    exit 0
+fi
+
+# Context Hierarchy Header
+echo "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+echo "┃ $(tput bold)$(tput setaf 6)CONTEXT LOADED BY CLAUDE$(tput sgr0)                     ┃"
+echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+echo ""
+
+# 1. Instructions (what you tell Claude)
+echo "$(tput bold)📋 Instructions$(tput sgr0) $(tput dim)(what you tell Claude)$(tput sgr0)"
+
+# Check for personal CLAUDE.md
+personal_claude=""
+if [[ -f "$HOME/CLAUDE.md" ]]; then
+    personal_claude="$HOME/CLAUDE.md"
+elif [[ -f "$HOME/.claude/CLAUDE.md" ]]; then
+    personal_claude="$HOME/.claude/CLAUDE.md"
+fi
+
+if [[ -n "$personal_claude" ]]; then
+    size=$(stat -f%z "$personal_claude" 2>/dev/null || stat -c%s "$personal_claude" 2>/dev/null)
+    echo "  $(tput setaf 2)✓$(tput sgr0) ~/CLAUDE.md ($(human_size $size))"
+    echo "    $(tput dim)↳ Applies to all projects$(tput sgr0)"
+else
+    echo "  $(tput setaf 3)✗$(tput sgr0) ~/CLAUDE.md $(tput dim)(create for personal prefs)$(tput sgr0)"
+fi
+
+# Check for project CLAUDE.md
+if [[ -f "$full_path/CLAUDE.md" ]]; then
+    size=$(stat -f%z "$full_path/CLAUDE.md" 2>/dev/null || stat -c%s "$full_path/CLAUDE.md" 2>/dev/null)
+    lines=$(wc -l < "$full_path/CLAUDE.md")
+    echo "  $(tput setaf 2)✓$(tput sgr0) ./CLAUDE.md ($(human_size $size), $lines lines)"
+    echo "    $(tput dim)↳ Project-specific instructions$(tput sgr0)"
+else
+    echo "  $(tput dim)✗ ./CLAUDE.md (none)$(tput sgr0)"
+fi
+
+echo ""
+
+# 2. Memory (what Claude learned)
+echo "$(tput bold)🧠 Memory$(tput sgr0) $(tput dim)(what Claude learned)$(tput sgr0)"
+
+encoded_path=$(encode_project_path "$full_path")
+session_dir="$HOME/.claude/projects/$encoded_path"
+memory_dir="$session_dir/memory"
+
+if [[ -d "$memory_dir" ]]; then
+    memory_files=($(ls "$memory_dir"/*.md 2>/dev/null))
+    if [[ ${#memory_files[@]} -gt 0 ]]; then
+        for mem_file in "${memory_files[@]}"; do
+            size=$(stat -f%z "$mem_file" 2>/dev/null || stat -c%s "$mem_file" 2>/dev/null)
+            basename=$(basename "$mem_file")
+            echo "  $(tput setaf 2)✓$(tput sgr0) $basename ($(human_size $size))"
+        done
+        echo "    $(tput dim)↳ Claude's notes from previous sessions$(tput sgr0)"
+    else
+        echo "  $(tput setaf 3)○$(tput sgr0) MEMORY.md $(tput dim)(empty - Claude will learn here)$(tput sgr0)"
+    fi
+elif [[ -d "$session_dir" ]]; then
+    echo "  $(tput dim)✗ No memory yet (will be created on first use)$(tput sgr0)"
+else
+    echo "  $(tput dim)✗ No sessions yet (memory created after first launch)$(tput sgr0)"
+fi
+
+echo ""
+
+# Helpful tip
+echo "$(tput dim)────────────────────────────────────────────────$(tput sgr0)"
+if [[ -z "$personal_claude" ]]; then
+    echo "$(tput dim)💡 Tip: Create ~/CLAUDE.md for preferences that apply$(tput sgr0)"
+    echo "$(tput dim)   to all your projects (like journal locations!)$(tput sgr0)"
+else
+    echo "$(tput dim)💡 CLAUDE.md = you instruct | MEMORY.md = Claude learns$(tput sgr0)"
+fi
+
+echo ""
+
+# Show CLAUDE.md preview if exists
+if [[ -f "$full_path/CLAUDE.md" ]]; then
+    echo "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+    echo "┃ $(tput bold)CLAUDE.md Preview$(tput sgr0)                            ┃"
+    echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+    head -n 10 "$full_path/CLAUDE.md"
+    echo ""
+fi
+
+# Show git status if git repo
+if [[ -d "$full_path/.git" ]]; then
+    echo "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+    echo "┃ $(tput bold)Git Status$(tput sgr0)                                   ┃"
+    echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+    (cd "$full_path" && git status -s 2>/dev/null | head -n 15)
+    echo ""
+fi
+
+# Show contents
+echo "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+echo "┃ $(tput bold)Directory Contents$(tput sgr0)                           ┃"
+echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+list_contents "$full_path" 20
+PREVIEW_EOF
+
+    # Export variables for preview script
+    export MAP_FILE="$map_file"
+    export ROOT_PATH="$root_path"
+    chmod +x "$preview_script"
+
+    # Format root path with ~ shorthand
+    local display_path="${root_path/#$HOME/\~}"
+
+    local header
+    header="╭─────────────────────────────────────────╮
+│            AI Launcher                  │
+│          by Solent Labs™                │
+╰─────────────────────────────────────────╯
+
+${#projects[@]} projects in ${display_path}
+Type to filter • Arrows to navigate"
+
+    local selection
+    local relative
+
+    # Find line number of recent project for cursor positioning
+    local recent_line=1
+    if [[ -n "$recent_display" ]]; then
+        for i in "${!display_lines[@]}"; do
+            if [[ "${display_lines[$i]}" == "$recent_display" ]]; then
+                recent_line=$((i + 1))
+                break
+            fi
+        done
+    fi
+
+    while true; do
+        selection=$(printf '%s\n' "${display_lines[@]}" | fzf \
+            --exact \
+            --layout=reverse \
+            --border=rounded \
+            --header="$header" \
+            --header-first \
+            --prompt="> " \
+            --preview="$preview_script {}" \
+            --preview-window=right:70%:wrap \
+            --bind "start:pos($recent_line)") || true
+
+        if [[ -z "$selection" ]]; then
+            rm -f "$preview_script" "$map_file"
+            echo "Cancelled." >&2
+            exit 0
+        fi
+
+        # Trim trailing whitespace
+        selection="${selection%"${selection##*[![:space:]]}"}"
+
+        # Check if folder (ends with /) - loop back
+        if [[ "$selection" == */ ]]; then
+            continue
+        fi
+
+        # Handle management options
+        if [[ "$selection" == "↻ Rescan" ]]; then
+            rm -f "$preview_script" "$map_file"
+            local cyan='\033[1;36m'
+            local reset='\033[0m'
+            echo "" >&2
+            echo -e "${cyan}Rescanning...${reset}" >&2
+            sleep 0.5
+            # Recursively call show_menu to rescan
+            show_menu
+            return $?
+        fi
+
+        if [[ "$selection" == "+ Add path" ]]; then
+            rm -f "$preview_script" "$map_file"
+            echo "" >&2
+            add_manual_path >&2
+            if [[ $? -eq 0 ]]; then
+                local green='\033[0;32m'
+                local reset='\033[0m'
+                echo -e "${green}Refreshing menu...${reset}" >&2
+                sleep 1
+                # Recursively call show_menu to show updated list
+                show_menu
+                return $?
+            fi
+            # If cancelled, return to menu
+            continue
+        fi
+
+        if [[ "$selection" == "- Remove path" ]]; then
+            rm -f "$preview_script" "$map_file"
+            remove_manual_path >&2
+            if [[ $? -eq 0 ]]; then
+                local green='\033[0;32m'
+                local reset='\033[0m'
+                echo -e "${green}Refreshing menu...${reset}" >&2
+                sleep 1
+                # Recursively call show_menu to show updated list
+                show_menu
+                return $?
+            fi
+            # If cancelled, return to menu
+            continue
+        fi
+
+        # Look up path from selection
+        relative="${path_map[$selection]}"
+        if [[ -z "$relative" ]]; then
+            continue
+        fi
+
+        break
+    done
+
+    rm -f "$preview_script" "$map_file"
+    echo "${root_path}/${relative}"
+}
+
+usage() {
+    cat << EOF
+Usage: ai-launcher [PATHS...] [OPTIONS]
+
+Arguments:
+  PATHS         Directories to scan for .git projects
+
+Options:
+  --add         Browse and add a directory to manual paths
+  --remove      Remove a manual path interactively
+  --list        List all discovered projects
+  --help        Show this help
+
+Examples:
+  ai-launcher ~/projects/work ~/projects/personal
+  ai-launcher --add          # Interactive directory browser
+  ai-launcher --list ~/projects
+
+Falls back to ~/.claude/project-launcher.conf if no paths given.
+EOF
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    local -a paths=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --add)
+                add_manual_path
+                exit 0
+                ;;
+            --remove)
+                remove_manual_path
+                exit 0
+                ;;
+            --list)
+                shift
+                load_config "$@"
+                list_projects
+                exit 0
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                paths+=("$1")
+                ;;
+        esac
+        shift
+    done
+
+    check_dependencies
+    load_config "${paths[@]}"
+
+    local selected_path
+    selected_path=$(show_menu)
+
+    if [[ -n "$selected_path" && -d "$selected_path" ]]; then
+        save_to_history "$selected_path"
+        local green='\033[0;32m'
+        local cyan='\033[1;36m'
+        local reset='\033[0m'
+        local dim='\033[2m'
+        local bold='\033[1m'
+
+        echo -e "${green}Opening AI assistant in:${reset} ${cyan}$selected_path${reset}"
+        echo ""
+
+        # Show session configuration
+        echo -e "${bold}🔧 Session Configuration:${reset}"
+
+        # Check for project permissions
+        if [[ -f "$selected_path/.claude/settings.local.json" ]]; then
+            local perm_count
+            perm_count=$(grep -o '"Bash(' "$selected_path/.claude/settings.local.json" 2>/dev/null | wc -l || echo "0")
+            perm_count="${perm_count// /}"
+            if [[ "$perm_count" -gt 0 ]]; then
+                echo -e "  ${green}✓${reset} $perm_count auto-approved commands"
+            else
+                echo -e "  ${dim}○ No pre-approved permissions${reset}"
+            fi
+        else
+            echo -e "  ${dim}○ No pre-approved permissions${reset}"
+        fi
+
+        # Check for MCP servers
+        if [[ -f "$HOME/.claude/mcp.json" ]]; then
+            echo -e "  ${green}✓${reset} MCP servers configured"
+        else
+            echo -e "  ${dim}○ No MCP servers configured${reset}"
+        fi
+
+        # Check for hooks
+        if [[ -f "$HOME/.claude/hooks.json" ]]; then
+            echo -e "  ${green}✓${reset} Hooks configured"
+        else
+            echo -e "  ${dim}○ No hooks configured${reset}"
+        fi
+
+        # Check model selection
+        if [[ -f "$HOME/.claude/settings.json" ]]; then
+            local model
+            model=$(grep -o '"model"[[:space:]]*:[[:space:]]*"[^"]*"' "$HOME/.claude/settings.json" 2>/dev/null | cut -d'"' -f4)
+            if [[ -n "$model" ]]; then
+                echo -e "  ${green}✓${reset} Model: $model"
+            else
+                echo -e "  ${dim}○ Model: default (sonnet)${reset}"
+            fi
+        else
+            echo -e "  ${dim}○ Model: default (sonnet)${reset}"
+        fi
+
+        echo ""
+
+        # Show Claude Memory
+        echo -e "${bold}🧠 Claude Memory:${reset}"
+        local has_memory=false
+
+        # Check personal memory
+        if [[ -f "$HOME/.claude/projects/-home-$(whoami)/memory/MEMORY.md" ]]; then
+            local personal_lines
+            personal_lines=$(wc -l < "$HOME/.claude/projects/-home-$(whoami)/memory/MEMORY.md" 2>/dev/null || echo "0")
+            if [[ "$personal_lines" -gt 0 ]]; then
+                echo -e "  ${green}✓${reset} Personal: $personal_lines lines"
+                has_memory=true
+            else
+                echo -e "  ${dim}○ Personal: empty${reset}"
+            fi
+        fi
+
+        # Check project memory (encode path)
+        local encoded_path="${selected_path//\//-}"
+        encoded_path="${encoded_path//_/-}"
+        if [[ -f "$HOME/.claude/projects/${encoded_path}/memory/MEMORY.md" ]]; then
+            local project_lines
+            project_lines=$(wc -l < "$HOME/.claude/projects/${encoded_path}/memory/MEMORY.md" 2>/dev/null || echo "0")
+            if [[ "$project_lines" -gt 0 ]]; then
+                echo -e "  ${green}✓${reset} Project: $project_lines lines"
+                has_memory=true
+            else
+                echo -e "  ${dim}○ Project: empty${reset}"
+            fi
+        fi
+
+        if [[ "$has_memory" == "false" ]]; then
+            echo -e "  ${dim}○ No memory files yet${reset}"
+        fi
+
+        echo ""
+
+        # Show Claude Skills
+        echo -e "${bold}🔨 Claude Skills:${reset}"
+        if [[ -d "$HOME/.claude/skills" ]]; then
+            local skill_count
+            skill_count=$(find "$HOME/.claude/skills" -maxdepth 2 -name "SKILL.md" 2>/dev/null | wc -l)
+            skill_count="${skill_count// /}"
+            if [[ "$skill_count" -gt 0 ]]; then
+                local skills
+                skills=$(find "$HOME/.claude/skills" -maxdepth 1 -type d ! -name "skills" -exec basename {} \; 2>/dev/null | head -n 3 | tr '\n' ', ' | sed 's/,$//')
+                echo -e "  ${green}✓${reset} $skill_count available: $skills"
+            else
+                echo -e "  ${dim}○ No skills installed${reset}"
+            fi
+        else
+            echo -e "  ${dim}○ No skills installed${reset}"
+        fi
+
+        echo ""
+
+        # Show Global Context
+        echo -e "${bold}🌐 Global Context:${reset}"
+        local total_files=0
+        local cache_count=0
+        local plans_count=0
+        local plugins_count=0
+        local memories_count=0
+
+        [[ -d "$HOME/.claude/cache" ]] && cache_count=$(find "$HOME/.claude/cache" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l)
+        [[ -d "$HOME/.claude/plans" ]] && plans_count=$(find "$HOME/.claude/plans" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l)
+        [[ -d "$HOME/.claude/plugins/marketplaces" ]] && plugins_count=$(find "$HOME/.claude/plugins/marketplaces" -maxdepth 2 -name "README.md" 2>/dev/null | wc -l)
+        [[ -d "$HOME/.claude/projects" ]] && memories_count=$(find "$HOME/.claude/projects" -type f \( -path "*/memory/*.md" -o -path "*/journal/*.md" \) 2>/dev/null | wc -l)
+
+        # Trim whitespace
+        cache_count="${cache_count// /}"
+        plans_count="${plans_count// /}"
+        plugins_count="${plugins_count// /}"
+        memories_count="${memories_count// /}"
+
+        total_files=$((cache_count + plans_count + plugins_count + memories_count))
+
+        if [[ "$total_files" -gt 0 ]]; then
+            echo -e "  ${green}✓${reset} $total_files files loaded"
+            [[ "$cache_count" -gt 0 ]] && echo -e "    ${dim}• Cache: $cache_count${reset}"
+            [[ "$plans_count" -gt 0 ]] && echo -e "    ${dim}• Plans: $plans_count${reset}"
+            [[ "$plugins_count" -gt 0 ]] && echo -e "    ${dim}• Plugins: $plugins_count${reset}"
+            [[ "$memories_count" -gt 0 ]] && echo -e "    ${dim}• Project Memories: $memories_count${reset}"
+        else
+            echo -e "  ${dim}○ No global context files${reset}"
+        fi
+
+        echo ""
+
+        # Show Boundary Protection
+        local parent_dir
+        parent_dir=$(dirname "$selected_path")
+        local sibling_count
+        sibling_count=$(find "$parent_dir" -maxdepth 1 -type d ! -name "$(basename "$parent_dir")" ! -name ".*" ! -path "$selected_path" 2>/dev/null | wc -l)
+        sibling_count="${sibling_count// /}"
+
+        if [[ "$sibling_count" -gt 0 ]]; then
+            echo -e "${bold}🔒 Boundary Protection:${reset}"
+            echo -e "  ${green}✓${reset} $sibling_count sibling projects detected"
+            local forbidden
+            forbidden=$(find "$parent_dir" -maxdepth 1 -type d ! -name "$(basename "$parent_dir")" ! -name ".*" ! -path "$selected_path" -exec basename {} \; 2>/dev/null | head -n 3 | tr '\n' ', ' | sed 's/,$//')
+            [[ "$sibling_count" -gt 3 ]] && forbidden="$forbidden, ... +$((sibling_count - 3)) more"
+            echo -e "  ${green}✓${reset} Forbidden: $forbidden"
+            echo -e "  ${green}✓${reset} Allowed: $(basename "$selected_path") only"
+            echo ""
+        fi
+
+        echo ""
+        cd "$selected_path"
+        exec claude  # TODO: Make this configurable
+    fi
+}
+
+main "$@"

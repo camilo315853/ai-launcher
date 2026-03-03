@@ -62,3 +62,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Archive of planning documents
+archive/

@@ -1,4 +1,4 @@
-# Pre-commit hooks for claude-launcher
+# Pre-commit hooks for ai-launcher
 # Install: pip install pre-commit && pre-commit install
 # Run manually: pre-commit run --all-files
 

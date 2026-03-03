@@ -14,11 +14,12 @@ A terminal-first launcher that:
 - 🧠 **Context Management** - Maintains persistent context across sessions
 - 🔒 **Local-Only** - Everything stays on your machine
 - 🔍 **Project Switching** - Fuzzy search across all your projects
-- 🤖 **Multi-Tool Support** - Works with Claude Code, Gemini CLI, and more (coming soon)
+- 🤖 **Multi-Tool Support** - Works with Claude Code, Gemini CLI, and more
+- 👁️ **Context Transparency** - See exactly what files AI tools access
 
 ## Current Status
 
-**v0.1.0** - Initial release supporting Claude Code. Multi-tool support coming soon.
+**v0.1.0** - Multi-provider support with Claude Code and Gemini CLI.
 
 ## Install
 
@@ -36,21 +37,41 @@ pip install -e .
 
 ## Use
 
+**Basic usage:**
 ```bash
 ai-launcher ~/projects
+```
+
+**See what's available:**
+```bash
+ai-launcher --discover ~/projects
+ai-launcher --context
 ```
 
 Select a project, and your AI tool opens with full context.
 
 ## Features
 
+### Project Management
 - 🔍 **Fuzzy search** - Type to filter projects instantly
 - 📁 **Tree navigation** - See your project structure at a glance
 - 📋 **Preview pane** - Git status, context files, directory contents
 - ⚡ **Last opened** - Cursor starts on your most recent project
 - ➕ **Manual projects** - Add non-git directories
 - 🔗 **Symlink support** - Works with linked directories
-- 🧠 **Context awareness** - Detects and displays CLAUDE.md and other context files
+
+### Multi-Provider Support
+- 🤖 **Provider abstraction** - Switch between Claude Code, Gemini, and more
+- 🔧 **Per-project configuration** - Different AI tools for different projects
+- 📊 **Discovery mode** - See what providers are installed
+- 👁️ **Context visualization** - View what files AI tools access
+- 🧠 **Context awareness** - Detects CLAUDE.md, GEMINI.md, and other context files
+
+### Terminal Window Title
+- 📺 **Auto title setting** - Terminal shows "project → provider" for easy window identification
+- 🎨 **Customizable format** - Configure your preferred title style
+- 🪟 **Multi-window workflow** - Instantly identify which terminal has which project
+- 🖥️ **Broad compatibility** - Works with xterm, iTerm2, GNOME Terminal, Windows Terminal, tmux, and more
 
 ## Requirements
 
@@ -67,21 +88,32 @@ First run creates `~/.config/ai-launcher/config.toml`:
 paths = ["~/projects", "~/work"]
 max_depth = 5
 
-[ai-tools]
+[provider]
 default = "claude-code"
-# Multi-tool support coming soon
+
+# Per-project overrides (optional)
+[provider.per_project]
+"/home/user/gemini-project" = "gemini"
+"/home/user/claude-project" = "claude-code"
 ```
+
+### Available Providers
+
+- **claude-code** - Anthropic's Claude Code
+- **gemini** - Google's Gemini CLI
 
 ## Roadmap
 
 - [x] Project discovery and selection
 - [x] Claude Code integration
 - [x] Local context file detection
-- [ ] Gemini CLI support
+- [x] Multi-provider abstraction layer
+- [x] Gemini CLI support
+- [x] Provider discovery and context visualization
 - [ ] Universal context management (.ai-context/)
 - [ ] Context file templates and scaffolding
 - [ ] Cross-system sync (via git/rsync/dotfiles)
-- [ ] Multi-tool selector UI
+- [ ] Additional provider integrations (Cursor, Aider, etc.)
 
 ## Why Local-Only?
 
