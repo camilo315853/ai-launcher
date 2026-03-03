@@ -1,24 +1,31 @@
-"""CLI interface for claude-launcher."""
+"""CLI interface for ai-launcher.
 
-import os
-import subprocess  # nosec B404
+This module provides the main command-line interface using Typer, handling
+project selection, provider launching, and various commands like discovery
+and context viewing.
+
+Author: Solent Labs™
+Last Modified: 2026-02-10 (Added cleanup config to provider calls)
+"""
+
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import typer
 
 from ai_launcher import __version__
-from ai_launcher.core.config import ConfigManager, get_database_path
 from ai_launcher.core.discovery import get_all_projects
-from ai_launcher.core.storage import Storage
-from ai_launcher.ui.browser import browse_directory, remove_manual_path
+from ai_launcher.core.models import ConfigData
 from ai_launcher.ui.selector import select_project, show_project_list
-from ai_launcher.utils.git import interactive_clone
+from ai_launcher.ui.startup_report import display_launch_info
 from ai_launcher.utils.logging import setup_logging
 
+if TYPE_CHECKING:
+    from ai_launcher.providers.base import AIProvider
+
 app = typer.Typer(
-    help="Fast context switching for Claude Code projects",
+    help="AI coding assistant launcher with multi-provider support",
     add_completion=False,
 )
 
@@ -26,173 +33,318 @@ app = typer.Typer(
 def version_callback(value: bool) -> None:
     """Print version and exit."""
     if value:
-        typer.echo(f"claude-launcher {__version__}")
+        typer.echo(f"ai-launcher {__version__}")
         raise typer.Exit()
 
 
-@app.command()
+@app.callback(invoke_without_command=True)
 def main(
-    path: Optional[Path] = typer.Argument(
-        None,
-        help="Directory to scan for projects (optional)",
-        exists=True,
-    ),
-    version: Optional[bool] = typer.Option(
-        None,
+    version: bool = typer.Option(
+        False,
         "--version",
-        "-v",
+        "-V",
         help="Show version and exit",
         callback=version_callback,
         is_eager=True,
     ),
-    verbose: bool = typer.Option(False, "--verbose", help="Enable verbose logging"),
-    debug: bool = typer.Option(False, "--debug", help="Enable debug mode"),
-    setup: bool = typer.Option(False, "--setup", help="Run first-time setup"),
-    add: bool = typer.Option(False, "--add", help="Add a manual project path"),
-    remove: bool = typer.Option(False, "--remove", help="Remove a manual path"),
-    list_projects: bool = typer.Option(False, "--list", help="List all projects"),
-    recent: bool = typer.Option(False, "--recent", help="Jump to last opened project"),
-    clone: bool = typer.Option(False, "--clone", help="Clone a git repository"),
 ) -> None:
-    """Launch Claude Code with interactive project selection.
+    """AI coding assistant launcher with multi-provider support."""
 
-    Examples:
-        claude-launcher                    # Use configured paths
-        claude-launcher ~/projects         # Scan specific directory
-        claude-launcher /home/user/work    # Scan absolute path
-    """
+
+def _run_launcher(
+    provider_name: str,
+    path: Optional[Path] = None,
+    verbose: bool = False,
+    debug: bool = False,
+    list_projects: bool = False,
+    discover: bool = False,
+    context: bool = False,
+    cleanup: bool = False,
+    clean_provider: bool = False,
+    clean_cache: bool = False,
+    clean_npm: bool = False,
+    global_files: Optional[str] = None,
+    manual_paths: Optional[str] = None,
+) -> None:
+    """Internal function to run the launcher with specified provider."""
 
     # Setup logging
     logger = setup_logging(verbose=verbose or debug)
-    logger.debug("Claude Launcher starting")
+    logger.debug("AI Launcher starting")
     logger.debug(f"Version: {__version__}")
 
-    # Initialize config and storage
-    config_manager = ConfigManager()
-    storage = Storage(get_database_path())
+    # Build runtime config from CLI flags (no config file needed)
+    from ai_launcher.core.models import ConfigData, ScanConfig, UIConfig, CleanupConfig, ContextConfig, ProviderConfig
 
-    logger.debug(f"Config path: {config_manager.config_path}")
-    logger.debug(f"Database path: {storage.db_path}")
+    # Parse global files from comma-separated string
+    global_files_list = []
+    if global_files:
+        global_files_list = [f.strip() for f in global_files.split(",") if f.strip()]
 
-    # Handle --setup
-    if setup:
-        config = config_manager.run_first_time_setup()
-        sys.exit(0)
+    # Build cleanup config - each flag works independently
+    cleanup_enabled = cleanup or clean_provider or clean_cache or clean_npm
+    config = ConfigData(
+        scan=ScanConfig(
+            paths=[],  # Will be set from CLI argument
+            max_depth=5,
+            prune_dirs=["node_modules", ".cache", "venv", "__pycache__", ".git"],
+        ),
+        ui=UIConfig(
+            preview_width=70,
+            show_git_status=True,
+            set_terminal_title=True,
+            terminal_title_format="{project} → {provider}",
+        ),
+        cleanup=CleanupConfig(
+            enabled=cleanup_enabled,
+            clean_provider_files=cleanup or clean_provider,
+            clean_system_cache=clean_cache,
+            clean_npm_cache=clean_npm,
+        ),
+        context=ContextConfig(
+            global_files=global_files_list,
+        ),
+        provider=ProviderConfig(
+            default=provider_name,
+            per_project={},
+        ),
+    )
 
-    # Load config
-    config = config_manager.load()
-
-    # Determine scan paths: CLI argument takes precedence over config
+    # Determine scan paths: CLI argument takes precedence
     if path:
         scan_paths = [path.resolve()]
-    elif config.scan.paths:
-        scan_paths = config.scan.paths
     else:
-        print("Error: No directory specified.")
-        print("")
-        print("Usage:")
-        print("  claude-launcher ~/projects        # Scan a specific directory")
-        print("  claude-launcher --setup           # Run setup wizard")
-        print("  claude-launcher --help            # Show all options")
-        sys.exit(1)
+        # Only error if we need scan paths for the operation
+        if not (discover or context):
+            print(f"Error: No directory specified for {provider_name}")
+            print(f"Usage: ai-launcher {provider_name} ~/projects")
+            sys.exit(1)
+        # For discover/context without paths, use empty list
+        scan_paths = []
 
-    # Handle --add
-    if add:
-        print("Select a directory to add as a manual project path...")
-        selected_path = browse_directory()
-        if selected_path:
-            storage.add_manual_path(selected_path)
-            print(f"Added: {selected_path}")
-        sys.exit(0)
+    # Get all projects (needed for several commands)
+    # Parse manual paths from CLI flag
+    manual_project_list = []
+    if manual_paths:
+        from ai_launcher.core.models import Project
+        for mp in manual_paths.split(","):
+            mp = mp.strip()
+            if mp:
+                mp_path = Path(mp).expanduser()
+                if mp_path.exists():
+                    manual_project_list.append(Project(
+                        path=mp_path,
+                        name=mp_path.name,
+                        parent_path=mp_path.parent,
+                        is_git_repo=(mp_path / ".git").exists(),
+                        is_manual=True,
+                    ))
 
-    # Handle --remove
-    if remove:
-        remove_manual_path(storage)
-        sys.exit(0)
-
-    # Handle --clone
-    if clone:
-        cloned_path = interactive_clone(storage)
-        if cloned_path:
-            print(f"Launching Claude in: {cloned_path}")
-            launch_claude(cloned_path, storage)
-        sys.exit(0)
-
-    # Get all projects
-    manual_projects = storage.get_manual_projects()
     all_projects = get_all_projects(
         scan_paths,
         config.scan.max_depth,
         config.scan.prune_dirs,
-        manual_projects,
-    )
+        manual_project_list,
+    ) if scan_paths else []
+
+    # Handle --discover
+    if discover:
+        from ai_launcher.core.provider_discovery import ProviderDiscovery
+        from ai_launcher.ui.discovery import show_discovery_report
+
+        discovery = ProviderDiscovery()
+        provider_infos = discovery.detect_all()
+
+        show_discovery_report(all_projects, provider_infos, scan_paths)
+        sys.exit(0)
+
+    # Handle --context
+    if context:
+        from ai_launcher.core.provider_discovery import ProviderDiscovery
+        from ai_launcher.ui.context_viewer import show_context_viewer
+
+        discovery = ProviderDiscovery()
+        provider_infos = discovery.detect_all()
+
+        show_context_viewer(provider_infos, all_projects)
+        sys.exit(0)
 
     # Handle --list
     if list_projects:
         show_project_list(all_projects)
         sys.exit(0)
 
-    # Handle --recent
-    if recent:
-        last_opened = storage.get_last_opened()
-        if not last_opened:
-            print("No recent project found.")
-            sys.exit(1)
-
-        project_path = Path(last_opened)
-        if not project_path.exists():
-            print(f"Last opened project not found: {project_path}")
-            sys.exit(1)
-
-        print(f"Launching Claude in: {project_path}")
-        launch_claude(project_path, storage)
-        sys.exit(0)
+    # Parse manual paths for display (convert to list of path strings)
+    manual_paths_list = []
+    if manual_paths:
+        manual_paths_list = [mp.strip() for mp in manual_paths.split(",") if mp.strip()]
 
     # Interactive selection
     selected_project = select_project(
-        all_projects, storage, config.ui.show_git_status, config_manager, scan_paths
+        all_projects, config.ui.show_git_status, config, scan_paths, manual_paths_list
     )
 
     if selected_project is None:
-        print("Claude Launcher: No project selected")
+        print("AI Launcher: No project selected")
         sys.exit(0)
 
-    # Launch Claude
-    print(f"Launching Claude in: {selected_project.path}")
-    launch_claude(selected_project.path, storage)
+    # Launch AI provider
+    launch_ai(selected_project.path, config=config)
 
 
-def launch_claude(project_path: Path, storage: Storage) -> None:
-    """Launch Claude Code in the specified project directory.
+def launch_ai(
+    project_path: Path,
+    provider: Optional["AIProvider"] = None,
+    config: Optional[ConfigData] = None,
+) -> None:
+    """Launch AI provider in the specified project directory.
 
     Args:
         project_path: Path to the project
-        storage: Storage instance for tracking
+        provider: Optional AIProvider instance. If None, determined from config.
+        config: Optional ConfigData. If None, default config is created.
     """
+    from ai_launcher.providers.registry import get_provider
+
     # Verify directory exists
     if not project_path.exists():
         print(f"Error: Directory not found: {project_path}")
         sys.exit(1)
 
-    # Record as last opened
-    storage.set_last_opened(project_path)
+    # Determine provider if not explicitly provided
+    if provider is None:
+        # Use default config if none provided
+        if config is None:
+            from ai_launcher.core.models import ConfigData, ScanConfig, UIConfig, CleanupConfig, ContextConfig, ProviderConfig
+            config = ConfigData(
+                scan=ScanConfig(paths=[], max_depth=5, prune_dirs=[]),
+                ui=UIConfig(),
+                cleanup=CleanupConfig(enabled=False),
+                context=ContextConfig(global_files=[]),
+                provider=ProviderConfig(default="claude-code", per_project={}),
+            )
 
-    # Change to project directory
-    os.chdir(project_path)
+        # Check per-project override
+        project_str = str(project_path)
+        if project_str in config.provider.per_project:
+            provider_name = config.provider.per_project[project_str]
+        else:
+            provider_name = config.provider.default
 
-    # Launch Claude
-    try:
-        subprocess.run(["claude"], check=True)  # nosec B603, B607
-    except FileNotFoundError:
-        print("Error: 'claude' command not found.")
-        print("Make sure Claude Code CLI is installed.")
-        sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        print(f"Error launching Claude: {e}")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\nInterrupted by user.")
-        sys.exit(0)
+        provider = get_provider(provider_name)
+
+    # Clean environment before launching (if configured)
+    print()
+    provider.cleanup_environment(verbose=True, cleanup_config=config.cleanup)
+
+    # Display launch information and launch provider
+    display_launch_info(project_path, provider, verbose=True)
+    provider.launch_with_title(
+        project_path,
+        set_title=config.ui.set_terminal_title,
+        title_format=config.ui.terminal_title_format,
+    )
+
+
+@app.command()
+def claude(
+    path: Optional[Path] = typer.Argument(
+        None,
+        help="Directory to scan for projects (optional)",
+        exists=True,
+    ),
+    verbose: bool = typer.Option(False, "--verbose", help="Enable verbose logging"),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug mode"),
+    list_projects: bool = typer.Option(False, "--list", help="List all projects"),
+    discover: bool = typer.Option(
+        False, "--discover", "-d", help="Show discovery report"
+    ),
+    context: bool = typer.Option(
+        False, "--context", "-c", help="Show context viewer"
+    ),
+    # Configuration options
+    cleanup: bool = typer.Option(
+        False, "--cleanup/--no-cleanup", help="Clean AI assistant cache/logs"
+    ),
+    clean_provider: bool = typer.Option(
+        False, "--clean-provider/--no-clean-provider", help="Clean AI assistant cache/logs"
+    ),
+    clean_cache: bool = typer.Option(
+        False, "--clean-cache/--no-clean-cache", help="Clean system cache (~/.cache)"
+    ),
+    clean_npm: bool = typer.Option(
+        False, "--clean-npm/--no-clean-npm", help="Clean npm cache"
+    ),
+    global_files: Optional[str] = typer.Option(
+        None, "--global-files", help="Comma-separated list of global context files"
+    ),
+    manual_paths: Optional[str] = typer.Option(
+        None, "--manual-paths", help="Comma-separated list of manual project paths"
+    ),
+) -> None:
+    """Launch Claude Code with project selection.
+
+    Configuration is passed via CLI flags.
+
+    Examples:
+        ai-launcher claude ~/projects/solentlabs
+        ai-launcher claude ~/projects --global-files ~/.claude/RULES.md
+        ai-launcher claude ~/projects --cleanup --clean-cache
+    """
+    # Just call main() with provider forced to claude-code
+    _run_launcher("claude-code", path, verbose, debug, list_projects, discover, context,
+                  cleanup, clean_provider, clean_cache, clean_npm, global_files, manual_paths)
+
+
+@app.command()
+def gemini(
+    path: Optional[Path] = typer.Argument(
+        None,
+        help="Directory to scan for projects (optional)",
+        exists=True,
+    ),
+    verbose: bool = typer.Option(False, "--verbose", help="Enable verbose logging"),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug mode"),
+    list_projects: bool = typer.Option(False, "--list", help="List all projects"),
+    discover: bool = typer.Option(
+        False, "--discover", "-d", help="Show discovery report"
+    ),
+    context: bool = typer.Option(
+        False, "--context", "-c", help="Show context viewer"
+    ),
+    # Configuration options
+    cleanup: bool = typer.Option(
+        False, "--cleanup/--no-cleanup", help="Clean AI assistant cache/logs"
+    ),
+    clean_provider: bool = typer.Option(
+        False, "--clean-provider/--no-clean-provider", help="Clean AI assistant cache/logs"
+    ),
+    clean_cache: bool = typer.Option(
+        False, "--clean-cache/--no-clean-cache", help="Clean system cache (~/.cache)"
+    ),
+    clean_npm: bool = typer.Option(
+        False, "--clean-npm/--no-clean-npm", help="Clean npm cache"
+    ),
+    global_files: Optional[str] = typer.Option(
+        None, "--global-files", help="Comma-separated list of global context files"
+    ),
+    manual_paths: Optional[str] = typer.Option(
+        None, "--manual-paths", help="Comma-separated list of manual project paths"
+    ),
+) -> None:
+    """Launch Gemini CLI with project selection.
+
+    Configuration is passed via CLI flags.
+
+    Examples:
+        ai-launcher gemini ~/projects/external
+        ai-launcher gemini ~/projects --global-files ~/.claude/RULES.md
+        ai-launcher gemini ~/projects --cleanup --clean-cache
+    """
+    # Just call main() with provider forced to gemini
+    _run_launcher("gemini", path, verbose, debug, list_projects, discover, context,
+                  cleanup, clean_provider, clean_cache, clean_npm, global_files, manual_paths)
+
 
 
 if __name__ == "__main__":

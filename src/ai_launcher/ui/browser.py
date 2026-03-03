@@ -1,11 +1,8 @@
-"""Directory browser for claude-launcher."""
+"""Directory browser for ai-launcher."""
 
 import subprocess  # nosec B404
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
-
-if TYPE_CHECKING:
-    from ai_launcher.core.storage import Storage
+from typing import Optional
 
 
 def browse_directory(start_path: Optional[Path] = None) -> Optional[Path]:
@@ -52,8 +49,11 @@ def browse_directory(start_path: Optional[Path] = None) -> Optional[Path]:
         # Build header
         header = f"""╭─────────────────────────────────────────╮
 │         Directory Browser               │
+│          by Solent Labs™                │
 ╰─────────────────────────────────────────╯
+
 Current: {current_path}
+Select '.' to add current directory
 
 . = Select this directory
 .. = Go up one level
@@ -119,78 +119,3 @@ fi
             # Navigate into subdirectory (strip @ if symlink)
             dir_name = selected.rstrip("@")
             current_path = current_path / dir_name
-
-
-def remove_manual_path(storage: "Storage") -> bool:
-    """Interactive removal of manual paths.
-
-    Args:
-        storage: Storage instance
-
-    Returns:
-        True if a path was removed, False otherwise
-    """
-
-    manual_paths = storage.get_manual_paths()
-
-    if not manual_paths:
-        print("No manual paths to remove.")
-        return False
-
-    # Build header
-    count = len(manual_paths)
-    header = f"""╭─────────────────────────────────────────╮
-│   Remove Manual Path ({count} total)        │
-╰─────────────────────────────────────────╯
-Select path to remove (Esc to cancel)"""
-
-    # Build preview command
-    preview_cmd = """
-echo 'Will remove:'
-echo ''
-echo '  {}'
-echo ''
-if [[ -d '{}' ]]; then
-    echo 'Directory exists'
-else
-    echo 'Directory does not exist'
-fi
-"""
-
-    # Run fzf
-    try:
-        process = subprocess.Popen(  # nosec B603, B607
-            [
-                "fzf",
-                "--height=50%",
-                "--layout=reverse",
-                "--border=rounded",
-                f"--header={header}",
-                "--header-first",
-                "--prompt=Remove > ",
-                f"--preview={preview_cmd}",
-                "--preview-window=right:60%:wrap",
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True,
-        )
-
-        stdout, _ = process.communicate(input="\n".join(manual_paths))
-
-        if process.returncode != 0:
-            print("Cancelled.")
-            return False
-
-        selected = stdout.strip()
-        if not selected:
-            print("Cancelled.")
-            return False
-
-    except FileNotFoundError:
-        print("Error: fzf not found")
-        return False
-
-    # Remove the path
-    storage.remove_manual_path(selected)
-    return True

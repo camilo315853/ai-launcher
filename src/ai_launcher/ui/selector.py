@@ -1,4 +1,12 @@
-"""Project selector UI for claude-launcher."""
+"""Project selector UI for ai-launcher.
+
+This module provides the interactive fuzzy-search project selector using fzf,
+with preview pane, action menu, and support for rescanning, adding/removing
+paths, and accessing settings.
+
+Author: Solent Labs™
+Last Modified: 2026-02-10 (Added settings menu item)
+"""
 
 import os
 import subprocess  # nosec B404
@@ -6,10 +14,9 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-from ai_launcher.core.config import ConfigManager
+# ConfigManager removed - using runtime config from CLI flags
 from ai_launcher.core.discovery import get_all_projects
 from ai_launcher.core.models import Project
-from ai_launcher.core.storage import Storage
 from ai_launcher.ui.preview import build_tree_view
 
 
@@ -20,19 +27,19 @@ def clear_screen() -> None:
 
 def select_project(
     projects: List[Project],
-    storage: Storage,
     show_git_status: bool = True,
-    config_manager: Optional[ConfigManager] = None,
+    config: Optional["ConfigData"] = None,
     scan_paths: Optional[List[Path]] = None,
+    manual_paths: Optional[List[str]] = None,
 ) -> Optional[Project]:
     """Show interactive project selector with action support.
 
     Args:
         projects: List of projects to choose from (already sorted)
-        storage: Storage instance for last opened tracking
         show_git_status: Whether to show git status in preview
-        config_manager: Config manager for add/remove actions (optional)
+        config: Configuration data from CLI flags (optional)
         scan_paths: Original scan paths for rescan action (optional)
+        manual_paths: Manual project paths from CLI flags (optional)
 
     Returns:
         Selected Project or None if cancelled
@@ -48,10 +55,6 @@ def select_project(
 
         # Clear screen before launching fzf
         clear_screen()
-
-        # Get default selection index
-        # Note: Not currently used - could reorder choices to put default first
-        # default_index = storage.get_default_selection_index(current_projects)
 
         # Determine base path for display
         # Use the actual scan path for header and tree display
@@ -71,45 +74,57 @@ def select_project(
 
         # Add action menu items at the bottom
         choices.append("__ACTION__\t\t")
-        choices.append("__ACTION__\t\t↻ Rescan")
-        choices.append("__ACTION__\t\t+ Add path")
-        choices.append("__ACTION__\t\t- Remove path")
+        choices.append("__ACTION__\t\t⚙️ Configuration")
 
         # Build header with project info
         project_count = len(current_projects)
 
+        # Format base path with ~ shorthand
+        home = Path.home()
+        display_base = f"~/{base_path.relative_to(home)}" if base_path.is_relative_to(home) else str(base_path)
+
         header = f"""╭─────────────────────────────────────────╮
-│      Claude Code Launcher               │
+│            AI Launcher                  │
+│          by Solent Labs™                │
 ╰─────────────────────────────────────────╯
 
-{project_count} project{"s" if project_count != 1 else ""} in {base_path}
-
-Type to filter, arrows to navigate.
+{project_count} project{"s" if project_count != 1 else ""} in {display_base}
+Type to filter • Arrows to navigate
+─────────────────────────────────────────
 """
 
         # Build preview command using helper script
         helper_script = Path(__file__).parent / "_preview_helper.py"
         preview_cmd = f"{sys.executable} {helper_script} {{}}"
 
+        # Set environment variables for preview helper
+        env = os.environ.copy()
+        if scan_paths:
+            env["AI_LAUNCHER_SCAN_PATHS"] = ":".join(str(p) for p in scan_paths)
+        if config and config.context.global_files:
+            env["AI_LAUNCHER_GLOBAL_FILES"] = ",".join(config.context.global_files)
+        if manual_paths:
+            env["AI_LAUNCHER_MANUAL_PATHS"] = ",".join(manual_paths)
+        if config:
+            env["AI_LAUNCHER_PROVIDER"] = config.provider.default
+
         # Run fzf directly via subprocess
         try:
             fzf_cmd = [
                 "fzf",
-                "--prompt=❯ ",
+                "--prompt=Filter: ",
                 "--height=100%",
                 "--layout=reverse",  # Nav at top
                 "--border=rounded",
-                "--border-label= Projects | Solent Labs™ ",
+                "--border-label= Projects ",
                 "--delimiter=\t\t",  # Use double-tab as delimiter
                 "--with-nth=2..",  # Show only the tree display (field 2 onwards)
                 "--preview-window=right:70%:wrap:border-left:nohidden",  # Preview 70%, list 30%
                 f"--preview={preview_cmd}",
                 f"--header={header}",
                 "--header-first",  # Display header before prompt
-                "--info=default",  # Show match count on separate line
-                "--color=header:italic",
+                "--info=hidden",  # Hide match counter
                 "--ansi",  # Enable ANSI color codes
-                "--exact",  # Use exact substring matching instead of fuzzy
             ]
 
             # Pass choices via stdin
@@ -122,6 +137,7 @@ Type to filter, arrows to navigate.
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 text=True,
+                env=env,
             )
 
             stdout, _ = process.communicate(input=input_data)
@@ -143,73 +159,16 @@ Type to filter, arrows to navigate.
                 return None
 
             # Handle action menu items
-            if selected == "__ACTION__\t\t↻ Rescan":
-                # Rescan - refresh project list
-                clear_screen()
-                if scan_paths and config_manager:
-                    config = config_manager.load()
-                    manual_projects = storage.get_manual_projects()
-                    current_projects = get_all_projects(
-                        scan_paths,
-                        config.scan.max_depth,
-                        config.scan.prune_dirs,
-                        manual_projects,
-                    )
-                    continue  # Loop back to show updated list
-                else:
-                    # Can't rescan without scan_paths
-                    continue
-
-            elif selected == "__ACTION__\t\t+ Add path":
-                # Add manual project
-                clear_screen()
-                from ai_launcher.ui.browser import browse_directory
-
-                new_path = browse_directory()
-                if new_path:
-                    storage.add_manual_path(new_path)
-                    clear_screen()
-                    print(f"✓ Added: {new_path}\n")
-                    # Refresh project list
-                    if scan_paths and config_manager:
-                        config = config_manager.load()
-                        manual_projects = storage.get_manual_projects()
-                        current_projects = get_all_projects(
-                            scan_paths,
-                            config.scan.max_depth,
-                            config.scan.prune_dirs,
-                            manual_projects,
-                        )
-                continue  # Loop back
-
-            elif selected == "__ACTION__\t\t- Remove path":
-                # Remove manual project
-                clear_screen()
-                from ai_launcher.ui.browser import remove_manual_path
-
-                removed_path = storage.get_manual_paths()  # Get current paths
-                if remove_manual_path(storage):
-                    clear_screen()
-                    # Show which path was removed by comparing before/after
-                    after_paths = set(storage.get_manual_paths())
-                    before_paths = set(removed_path)
-                    removed = before_paths - after_paths
-                    if removed:
-                        print(f"✓ Removed: {removed.pop()}\n")
-                    # Refresh project list
-                    if scan_paths and config_manager:
-                        config = config_manager.load()
-                        manual_projects = storage.get_manual_projects()
-                        current_projects = get_all_projects(
-                            scan_paths,
-                            config.scan.max_depth,
-                            config.scan.prune_dirs,
-                            manual_projects,
-                        )
-                continue  # Loop back
+            if selected == "__ACTION__\t\t⚙️ Configuration":
+                # Configuration preview is shown in right pane, just loop back
+                continue
 
             # Handle empty line action item (just loop back)
             elif selected == "__ACTION__\t\t":
+                continue
+
+            # Handle spacing lines (just loop back)
+            elif selected.startswith("__SPACE__"):
                 continue
 
             # Regular project selection
@@ -223,16 +182,21 @@ Type to filter, arrows to navigate.
                 clear_screen()
                 return project
 
-            # Fallback: try to match by index
-            try:
-                selected_index = choices.index(selected)
-                # Clear screen before launching Claude
-                clear_screen()
-                return current_projects[selected_index]
-            except ValueError:
-                clear_screen()
-                print(f"Warning: Could not find selected project: {selected}")
-                return None
+            # Not a project - check if it's a directory header or other non-selectable item
+            # Extract path from formatted line to check
+            parts = selected.split("\t\t", 1)
+            if len(parts) == 2:
+                path_str = parts[0]
+                try:
+                    path = Path(path_str).expanduser().resolve()
+                    # If it's a directory (folder header), just loop back
+                    if path.is_dir() and not (path / ".git").exists():
+                        continue
+                except Exception:
+                    pass
+
+            # If we get here, it's an unknown selection - just loop back instead of closing
+            continue
 
         except FileNotFoundError:
             print("Error: fzf not found. Please install fzf:")

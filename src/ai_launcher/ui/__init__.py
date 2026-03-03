@@ -1,1 +1,1 @@
-"""User interface components for claude-launcher."""
+"""User interface components for ai-launcher."""
