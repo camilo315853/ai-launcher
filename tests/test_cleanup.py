@@ -51,6 +51,9 @@ class TestCacheCleanup:
 
     def test_cleans_cache_directory(self, tmp_path, monkeypatch, cleanup_config):
         monkeypatch.setenv("HOME", str(tmp_path))
+        # Disable npm/provider cleanup to isolate cache test from system tools
+        cleanup_config.clean_npm_cache = False
+        cleanup_config.clean_provider_files = False
         with patch("pathlib.Path.home", return_value=tmp_path):
             cache_dir = tmp_path / ".cache"
             cache_dir.mkdir()
@@ -59,13 +62,6 @@ class TestCacheCleanup:
 
             cleanup_environment(verbose=False, cleanup_config=cleanup_config)
 
-            # Subdir and file should be cleaned (on Windows, may need retry)
-            import sys
-
-            if sys.platform == "win32":
-                import time
-
-                time.sleep(0.1)  # Windows file deletion can be async
             assert not (cache_dir / "subdir").exists()
             assert not (cache_dir / "file.txt").exists()
             # Cache dir itself should remain

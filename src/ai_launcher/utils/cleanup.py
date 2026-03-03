@@ -154,7 +154,7 @@ def cleanup_environment(
                 timeout=10,
             )  # nosec B603, B607
             logger.debug("Cleaned npm cache")
-        except (subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
+        except (subprocess.SubprocessError, OSError) as e:
             logger.debug(f"Could not clean npm cache: {e}")
 
     # Provider-specific cleanup (safe, only affects AI providers)
@@ -247,7 +247,7 @@ def cleanup_environment(
                                 logger.debug(
                                     f"Removed old Claude version(s): {', '.join(removed_versions)}"
                                 )
-                except (subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
+                except (subprocess.SubprocessError, OSError) as e:
                     logger.debug(f"Could not clean old Claude versions: {e}")
 
     if verbose:
