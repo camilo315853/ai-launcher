@@ -109,19 +109,6 @@ default = "claude-code"
 - **aider** - Aider pair programmer
 - **copilot** - GitHub Copilot CLI
 
-## Roadmap
-
-- [x] Project discovery and selection
-- [x] Claude Code integration
-- [x] Local context file detection
-- [x] Multi-provider abstraction layer
-- [x] Gemini CLI support
-- [x] Provider discovery and context visualization
-- [ ] Universal context management (.ai-context/)
-- [ ] Context file templates and scaffolding
-- [ ] Cross-system sync (via git/rsync/dotfiles)
-- [x] Additional provider integrations (Cursor, Aider, Copilot)
-
 ## Why Local-Only?
 
 Your code and context should stay on your machine. AI Launcher:
